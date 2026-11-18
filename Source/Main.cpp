@@ -61,6 +61,7 @@ public:
             planContent.addAndMakeVisible(component);
         for (auto* component : std::initializer_list<juce::Component*>{
                  &title, &subtitle, &wiringButton, &openButton, &planViewport, &audioViewport,
+                 &welcomeLead, &microphoneHelp, &loopbackHelp, &sendHelp,
                  &sessionTitle, &routingLabel, &loopInput, &ampOutputLabel, &ampOutput, &deviceSummary, &sendLabel, &sendLevel,
                  &selectedTake, &list, &nextButton, &backButton, &cancelButton, &normalise, &statusLabel, &progressBar})
             addAndMakeVisible(component);
@@ -69,8 +70,20 @@ public:
         title.setFont(juce::FontOptions(29.0f, juce::Font::bold));
         selectedTake.setFont(juce::FontOptions(15.0f, juce::Font::bold));
         selectedTake.setColour(juce::Label::textColourId, juce::Colour(accent));
-        subtitle.setText("Plan your capture", juce::dontSendNotification);
-        subtitle.setColour(juce::Label::textColourId, muted);
+
+        subtitle.setColour(juce::Label::textColourId, ink);
+        subtitle.setFont(juce::FontOptions(23.0f, juce::Font::bold));
+        welcomeLead.setText("Use one audio interface with 2 inputs and 1 or 2 outputs.", juce::dontSendNotification);
+        welcomeLead.setFont(juce::FontOptions(18.0f, juce::Font::bold));
+        welcomeLead.setColour(juce::Label::textColourId, ink);
+        microphoneHelp.setText("Microphone input\nConnect the mic in front of the speaker to an interface mic input.", juce::dontSendNotification);
+        loopbackHelp.setText("Loopback input\nSend a clean copy of the test signal back to a line input. Capture uses it to align the recording.", juce::dontSendNotification);
+        sendHelp.setText("One or two outputs\nSend one output to the amp via a reamp box. Use a second output for the loopback, or use internal loopback or a line-level split.", juce::dontSendNotification);
+        for (auto* label : {&microphoneHelp, &loopbackHelp, &sendHelp})
+        {
+            label->setColour(juce::Label::textColourId, muted);
+            label->setFont(juce::FontOptions(15.0f));
+        }
         for (auto* label : {&statusLabel, &stimulusName, &sessionTitle})
             label->setColour(juce::Label::textColourId, juce::Colour(accent));
         sessionTitle.setFont(juce::FontOptions(20.0f, juce::Font::bold));
@@ -169,15 +182,23 @@ public:
         backButton.onClick = [this] { goBack(); };
         cancelButton.onClick = [this] { cancel(); };
 
-        showStep(Step::audio);
+        showStep(Step::welcome);
         setSize(960, 700);
         startTimerHz(15);
 
+    }
+
+    void initialiseAudio()
+    {
+        if (callbackInstalled || requestingAudio)
+            return;
+        requestingAudio = true;
         const auto safe = juce::Component::SafePointer<CaptureView>(this);
         juce::RuntimePermissions::request(juce::RuntimePermissions::recordAudio, [safe](bool granted)
         {
             if (safe == nullptr)
                 return;
+            safe->requestingAudio = false;
             if (!granted)
             {
                 safe->status("Microphone access is required. Enable it in system settings.");
@@ -208,7 +229,7 @@ public:
                                                      float(getWidth()), float(getHeight()), false));
         graphics.fillAll();
         graphics.setColour(line);
-        graphics.fillRect(navigationDivider);
+        drawSteps(graphics);
         if (step == Step::calibration || step == Step::record)
         {
             drawMeter(graphics, loopMeterArea, "Loopback", loopMeter);
@@ -230,9 +251,10 @@ public:
             updateButton.setBounds(header.removeFromRight(124).withHeight(34));
         }
         title.setBounds(header);
-        subtitle.setBounds(area.removeFromTop(27));
-        auto gap = area.removeFromTop(14);
-        navigationDivider = gap.withY(gap.getCentreY()).withHeight(1);
+        stepperArea = area.removeFromTop(54);
+        area.removeFromTop(8);
+        subtitle.setBounds(area.removeFromTop(38));
+        area.removeFromTop(5);
 
         auto actions = area.removeFromBottom(42);
         nextButton.setBounds(actions.removeFromRight(164));
@@ -245,6 +267,12 @@ public:
         progressBar.setBounds(feedback.removeFromBottom(11));
         statusLabel.setBounds(feedback);
         area.removeFromBottom(8);
+
+        auto welcome = area.withTrimmedTop(6);
+        welcomeLead.setBounds(welcome.removeFromTop(34));
+        microphoneHelp.setBounds(welcome.removeFromTop(48));
+        loopbackHelp.setBounds(welcome.removeFromTop(48));
+        sendHelp.setBounds(welcome.removeFromTop(65));
 
         planViewport.setBounds(area);
         layoutPlan(std::max(1, area.getWidth() - planViewport.getScrollBarThickness()));
@@ -280,7 +308,49 @@ public:
     }
 
 private:
-    enum class Step { audio, plan, calibration, record, exportData, done };
+    enum class Step { welcome, audio, plan, calibration, record, exportData, done };
+    static constexpr std::array<const char*, 6> stepNames{"Start", "Audio", "Take plan", "Levels", "Record", "Export"};
+
+    void drawSteps(juce::Graphics& g)
+    {
+        const int active = static_cast<int>(step);
+        const float width = float(stepperArea.getWidth()) / float(stepNames.size());
+        const float y = float(stepperArea.getY() + 17);
+        const auto green = juce::Colour(accent);
+        for (int i = 1; i < static_cast<int>(stepNames.size()); ++i)
+        {
+            const float x = float(stepperArea.getX()) + (float(i) - 0.5f) * width;
+            g.setColour(i <= active ? green.withAlpha(0.65f) : line);
+            g.drawLine(x + 12, y, x + width - 12, y, 1.0f);
+        }
+        for (int i = 0; i < static_cast<int>(stepNames.size()); ++i)
+        {
+            const float x = float(stepperArea.getX()) + (float(i) + 0.5f) * width;
+            const auto dot = juce::Rectangle<float>(22.0f, 22.0f).withCentre({x, y});
+            const bool reached = i <= active;
+            g.setColour(i == active ? green : i < active ? juce::Colour(0xff244d48) : juce::Colour(background));
+            g.fillEllipse(dot);
+            g.setColour(reached ? green : line);
+            g.drawEllipse(dot, 1.0f);
+            g.setFont(juce::FontOptions(12.0f, juce::Font::bold));
+            if (i < active)
+            {
+                juce::Path tick;
+                tick.startNewSubPath(x - 4, y);
+                tick.lineTo(x - 1, y + 3);
+                tick.lineTo(x + 5, y - 3);
+                g.strokePath(tick, juce::PathStrokeType(1.5f));
+            }
+            else
+            {
+                g.setColour(i == active ? juce::Colour(background) : muted);
+                g.drawText(juce::String(i + 1), dot, juce::Justification::centred);
+            }
+            g.setColour(i == active ? ink : muted);
+            g.drawFittedText(stepNames[size_t(i)], int(x - width / 2), int(y + 14), int(width), 20,
+                             juce::Justification::centred, 1);
+        }
+    }
     enum class LevelCheck { loud, quiet, complete };
 
     std::array<juce::Component*, 15> planFields()
@@ -372,7 +442,10 @@ private:
     void showStep(Step next)
     {
         step = next;
+        const bool welcome = step == Step::welcome;
         const bool audio = step == Step::audio;
+        for (auto* label : {&welcomeLead, &microphoneHelp, &loopbackHelp, &sendHelp})
+            label->setVisible(welcome);
         const bool calibration = step == Step::calibration;
         const bool recording = step == Step::record;
         const bool exporting = step == Step::exportData;
@@ -389,15 +462,18 @@ private:
         selectedTake.setVisible(calibration || recording || exporting || step == Step::done);
         list.setVisible(recording);
         normalise.setVisible(exporting);
-        backButton.setVisible(step != Step::audio);
-        openButton.setVisible(audio);
+        backButton.setVisible(!welcome);
+        openButton.setVisible(welcome || audio);
         const juce::StringArray titles{
-            "1 / 5   Audio setup", "2 / 5   Capture plan", "3 / 5   Calibrate levels",
-            "4 / 5   Record takes", "5 / 5   Export dataset", "Capture complete"};
+            "Before you start", "Set up audio", "Plan your takes", "Check your levels",
+            "Record takes", "Export your dataset", "Capture complete"};
         subtitle.setText(titles[static_cast<int>(step)], juce::dontSendNotification);
         status("");
         if (audio)
+        {
+            initialiseAudio();
             refreshAudioChannels();
+        }
         resized();
         update();
         repaint();
@@ -503,6 +579,7 @@ private:
             return;
         switch (step)
         {
+            case Step::welcome: showStep(Step::audio); break;
             case Step::audio:
                 if (audioReady() && forceSampleRate() && audioReady())
                     showStep(session ? (allRecorded() ? Step::exportData : Step::calibration) : Step::plan);
@@ -533,6 +610,11 @@ private:
     {
         if (pending)
             return;
+        if (step == Step::audio)
+        {
+            showStep(Step::welcome);
+            return;
+        }
         if (step == Step::done || step == Step::exportData)
         {
             showStep(levelCheck == LevelCheck::complete ? Step::record : Step::calibration);
@@ -829,7 +911,8 @@ private:
             selectedTake.setText(step == Step::done ? "Dataset exported" : "All takes are saved. Export the dataset for Colab.",
                                  juce::dontSendNotification);
 
-        nextButton.setButtonText(step == Step::calibration && levelCheck != LevelCheck::complete
+        nextButton.setButtonText(step == Step::welcome ? "Get started"
+            : step == Step::calibration && levelCheck != LevelCheck::complete
             ? (levelCheck == LevelCheck::loud ? "Check loud setting" : "Check quiet setting")
             : step == Step::record ? (retake ? "Retake" : "Record take")
             : step == Step::exportData ? "Export dataset" : step == Step::done ? "Open dataset folder" : "Next");
@@ -867,10 +950,10 @@ private:
     juce::Component planContent;
     juce::Viewport planViewport, audioViewport;
     juce::StringArray activeInputs, activeOutputs;
-    Step step = Step::audio;
+    Step step = Step::welcome;
     std::optional<capture::Session> session;
     std::unique_ptr<juce::FileChooser> chooser;
-    juce::Label title, subtitle, nameLabel, controlsLabel, prioritiesLabel, countsLabel,
+    juce::Label title, subtitle, welcomeLead, microphoneHelp, loopbackHelp, sendHelp, nameLabel, controlsLabel, prioritiesLabel, countsLabel,
                 stimulusName, sessionTitle, routingLabel, ampOutputLabel, sendLabel, statusLabel, selectedTake, stepHint, budgetSummary, deviceSummary;
     juce::TextEditor name, trainCount, testCount, sendLevel;
     PlanGrid controls, priorities;
@@ -882,10 +965,11 @@ private:
     juce::ListBox list;
     std::vector<float> stimulus, sessionStimulus;
     capture::StimulusWindow calibrationExcerpt;
-    juce::Rectangle<int> navigationDivider, loopMeterArea, micMeterArea, takeSettingsArea;
+    juce::Rectangle<int> stepperArea, loopMeterArea, micMeterArea, takeSettingsArea;
     float loopMeter = 0.0f, micMeter = 0.0f;
     double progress = 0;
     juce::ProgressBar progressBar;
+    bool requestingAudio = false;
     bool callbackInstalled = false, pending = false;
     LevelCheck levelCheck = LevelCheck::loud;
     int captureIndex = -1;
