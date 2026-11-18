@@ -1,0 +1,80 @@
+name: Build Capture
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            app: ParametricNAM Capture
+          - os: windows-latest
+            app: ParametricNAM Capture.exe
+          - os: macos-latest
+            app: ParametricNAM Capture.app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out JUCE 8.0.6
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 8.0.6
+          path: ci-juce
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev
+      - run: cmake -S . -B build -DPNAM_JUCE_DIR=ci-juce -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+      - run: cmake --build build --config Release --parallel 2
+      - name: Simulate a capture session
+        if: runner.os == 'Linux'
+        run: |
+          scratch=$(mktemp -d)
+          "build/ParametricNAMCapture_artefacts/Release/ParametricNAM Capture" --self-test "$scratch/session"
+      - name: Package Capture
+        shell: bash
+        env:
+          APP: ${{ matrix.app }}
+          ARCHIVE: ParametricNAM-Capture-${{ runner.os }}-${{ runner.arch }}.zip
+        run: |
+          mkdir package
+          cp -R "build/ParametricNAMCapture_artefacts/Release/$APP" package/
+          cp README.md package/
+          cp ci-juce/LICENSE.md package/LICENSE-JUCE.md
+          (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip "$APP" README.md LICENSE-JUCE.md)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Capture-${{ runner.os }}-${{ runner.arch }}
+          path: ParametricNAM-Capture-*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Capture-*
+          path: packages
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --verify-tag --generate-notes packages/*.zip
