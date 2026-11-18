@@ -18,7 +18,7 @@ std::vector<float> marker()
     return signal;
 }
 
-float peak(const std::vector<float>& samples)
+float peak(std::span<const float> samples)
 {
     float value = 0;
     for (float sample : samples)
@@ -26,6 +26,35 @@ float peak(const std::vector<float>& samples)
     return value;
 }
 } // namespace
+
+StimulusWindow calibrationWindow(std::span<const float> stimulus)
+{
+    constexpr size_t checkFrames = 6 * sampleRate;
+    if (stimulus.size() <= checkFrames)
+        return {0, stimulus.size()};
+
+    const auto absoluteLess = [](float a, float b) { return std::abs(a) < std::abs(b); };
+    const auto peakIndex = size_t(std::max_element(stimulus.begin(), stimulus.end(), absoluteLess) - stimulus.begin());
+    const size_t first = peakIndex < checkFrames ? 0 : peakIndex + 1 - checkFrames;
+    const size_t last = std::min(peakIndex, stimulus.size() - checkFrames);
+    const auto energyAt = [&](size_t i) { return double(stimulus[i]) * stimulus[i]; };
+
+    double energy = 0;
+    for (size_t i = first; i < first + checkFrames; ++i)
+        energy += energyAt(i);
+    double highest = energy;
+    size_t start = first;
+    for (size_t i = first + 1; i <= last; ++i)
+    {
+        energy += energyAt(i + checkFrames - 1) - energyAt(i - 1);
+        if (energy > highest)
+        {
+            highest = energy;
+            start = i;
+        }
+    }
+    return {start, checkFrames};
+}
 
 std::vector<float> makeStimulus()
 {
@@ -86,7 +115,13 @@ void writeWav(const juce::File& file, const std::vector<float>& samples)
         throw std::runtime_error("Cannot replace " + file.getFileName().toStdString());
 }
 
-Analysed analyse(const Recording& recording, int frames, float markerLevel)
+LoopbackSyncError::LoopbackSyncError(float loopback, float microphone, float score)
+    : std::runtime_error("Could not find the sync marker on the loopback input."),
+      loopPeak(loopback), micPeak(microphone), correlation(score)
+{
+}
+
+Analysed analyse(const Recording& recording, int frames)
 {
     if (frames <= 0 || recording.loopback.size() != recording.microphone.size()
         || recording.loopback.size() < size_t(leadFrames + frames + tailFrames))
@@ -114,19 +149,21 @@ Analysed analyse(const Recording& recording, int frames, float markerLevel)
             bestIndex = start;
         }
     }
-    if (best < 0.65f || bestIndex < 0 || markerLevel <= 0)
-        throw std::runtime_error("Sync marker missing on the loopback channel. Check routing and input selection.");
+    const auto loopPeak = peak(recording.loopback);
+    const auto micPeak = peak(recording.microphone);
+    if (best < 0.65f || bestIndex < 0)
+        throw LoopbackSyncError(loopPeak, micPeak, best);
     const int delay = bestIndex - leadFrames / 2;
     const int offset = leadFrames + delay;
     if (offset < 0 || size_t(offset + frames) > recording.loopback.size())
         throw std::runtime_error("Measured latency is outside the capture window.");
 
-    return {delay, peak(recording.loopback), peak(recording.microphone), best,
+    return {delay, loopPeak, micPeak, best,
             {recording.loopback.begin() + offset, recording.loopback.begin() + offset + frames},
             {recording.microphone.begin() + offset, recording.microphone.begin() + offset + frames}};
 }
 
-double relativeInputError(const std::vector<float>& reference, const std::vector<float>& actual)
+double relativeInputError(std::span<const float> reference, std::span<const float> actual)
 {
     if (reference.size() != actual.size())
         throw std::runtime_error("Calibration length differs. Recalibrate before recording.");
@@ -140,21 +177,42 @@ double relativeInputError(const std::vector<float>& reference, const std::vector
     return signal > 0 ? std::sqrt(error / signal) : 1.0;
 }
 
-void requireUsable(const Analysed& take)
+void requireUsable(const Analysed& take, bool requireMicrophone)
 {
     if (take.loopPeak >= 0.995f || take.micPeak >= 0.995f)
         throw std::runtime_error("Clipping detected. Lower interface gain and recalibrate.");
-    if (peak(take.input) < 0.003f || peak(take.target) < 0.001f)
+    if (peak(take.input) < 0.003f || (requireMicrophone && peak(take.target) < 0.001f))
         throw std::runtime_error("Input or microphone signal is too quiet. Check routing and levels.");
 }
 
-void Recorder::start(const std::vector<float>& input, float sendGain, int loopIndex, int micIndex)
+std::optional<double> microphoneSnrDb(const Recording& recording, const Analysed& take)
+{
+    const int end = std::clamp(leadFrames / 2 + take.delay - sampleRate / 100,
+                               0, int(recording.microphone.size()));
+    const int start = std::max(0, end - sampleRate / 10);
+    if (end - start < sampleRate / 100 || take.target.empty())
+        return std::nullopt;
+
+    const auto power = [](std::span<const float> samples)
+    {
+        double energy = 0.0;
+        for (float value : samples)
+            energy += double(value) * value;
+        return energy / double(samples.size());
+    };
+    const auto noise = power(std::span<const float>(recording.microphone).subspan(size_t(start), size_t(end - start)));
+    const auto signal = power(take.target) - noise;
+    return 10.0 * std::log10(std::max(1e-12, signal) / std::max(1e-12, noise));
+}
+
+void Recorder::start(std::span<const float> input, float sendGain, int loopIndex, int micIndex)
 {
     if (state.load() == State::recording)
         throw std::runtime_error("A recording is already running.");
-    if (rate.load() != sampleRate || outputCount.load() != 1 || inputCount.load() != 2
+    const auto outputs = outputCount.load();
+    if (rate.load() != sampleRate || outputs < 1 || outputs > 2 || inputCount.load() != 2
         || loopIndex < 0 || micIndex < 0 || loopIndex > 1 || micIndex > 1 || loopIndex == micIndex)
-        throw std::runtime_error("Select two active inputs and one active output at 48 kHz.");
+        throw std::runtime_error("Select two inputs and one or two outputs at 48 kHz.");
     if (peak(input) * sendGain >= 1.0f)
         throw std::runtime_error("The send trim would clip the stimulus.");
     loop = loopIndex;
@@ -225,18 +283,24 @@ void Recorder::audioDeviceIOCallbackWithContext(const float* const* inputs, int 
     if (state.load() != State::recording)
         return;
     const float* activeInputs[2]{};
-    float* activeOutput = nullptr;
+    float* activeOutputs[2]{};
     int activeInputCount = 0, activeOutputCount = 0;
     for (int ch = 0; ch < ni; ++ch)
-        if (inputs[ch] && activeInputCount < 2)
-            activeInputs[activeInputCount++] = inputs[ch];
+        if (inputs[ch])
+        {
+            if (activeInputCount < 2)
+                activeInputs[activeInputCount] = inputs[ch];
+            ++activeInputCount;
+        }
     for (int ch = 0; ch < no; ++ch)
         if (outputs[ch])
         {
-            activeOutput = outputs[ch];
+            if (activeOutputCount < 2)
+                activeOutputs[activeOutputCount] = outputs[ch];
             ++activeOutputCount;
         }
-    if (activeInputCount != 2 || activeOutputCount != 1)
+    if (activeInputCount != 2 || activeOutputCount < 1 || activeOutputCount > 2
+        || activeOutputCount != outputCount.load())
     {
         state.store(State::failed);
         return;
@@ -244,7 +308,8 @@ void Recorder::audioDeviceIOCallbackWithContext(const float* const* inputs, int 
 
     const int from = cursor.load();
     const int count = std::min(samples, length.load() - from);
-    std::copy_n(playback.data() + from, count, activeOutput);
+    for (int ch = 0; ch < activeOutputCount; ++ch)
+        std::copy_n(playback.data() + from, count, activeOutputs[ch]);
     std::copy_n(activeInputs[loop], count, result.loopback.data() + from);
     std::copy_n(activeInputs[mic], count, result.microphone.data() + from);
     float inputPeak = 0.0f, targetPeak = 0.0f;

@@ -3,6 +3,7 @@
 #include "Smoke.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -34,7 +35,7 @@ class CaptureView final : public juce::Component, private juce::Timer, private j
 {
 public:
     CaptureView()
-        : list("Capture plan", this), stimulus(capture::makeStimulus()), progressBar(progress)
+        : audioSelector(devices, 0, 2, 0, 2, false, false, false, true), list("Capture plan", this), progressBar(progress)
     {
         theme.setColour(juce::Label::textColourId, ink);
         theme.setColour(juce::TextEditor::textColourId, ink);
@@ -47,12 +48,16 @@ public:
         theme.setColour(juce::ProgressBar::backgroundColourId, juce::Colour(0xff24324b));
         theme.setColour(juce::ProgressBar::foregroundColourId, juce::Colour(accent));
         setLookAndFeel(&theme);
+        planViewport.setViewedComponent(&planContent, false);
+        audioViewport.setViewedComponent(&audioSelector, false);
+        planViewport.setScrollBarsShown(true, false);
+        audioViewport.setScrollBarsShown(true, false);
+        for (auto* component : planFields())
+            planContent.addAndMakeVisible(component);
         for (auto* component : std::initializer_list<juce::Component*>{
-                 &title, &subtitle, &deviceButton, &planTab, &recordTab, &nameLabel, &name,
-                 &controlsLabel, &controls, &addControl, &prioritiesLabel, &priorities, &addPriority, &countsLabel,
-                 &trainCount, &testCount, &stimulusButton, &stimulusName, &createButton, &openButton,
-                 &sessionTitle, &routingLabel, &loopInput, &sendLabel, &sendLevel,
-                 &selectedTake, &list, &calibrateButton, &recordButton, &cancelButton, &normalise, &exportButton, &statusLabel, &progressBar})
+                 &title, &subtitle, &wiringButton, &openButton, &planViewport, &audioViewport,
+                 &sessionTitle, &routingLabel, &loopInput, &ampOutputLabel, &ampOutput, &deviceSummary, &sendLabel, &sendLevel,
+                 &selectedTake, &list, &nextButton, &backButton, &cancelButton, &normalise, &statusLabel, &progressBar})
             addAndMakeVisible(component);
 
         title.setText("ParametricNAM Capture", juce::dontSendNotification);
@@ -66,26 +71,30 @@ public:
         sessionTitle.setFont(juce::FontOptions(20.0f, juce::Font::bold));
         nameLabel.setText("Amplifier name", juce::dontSendNotification);
         controlsLabel.setText("Controls", juce::dontSendNotification);
-        prioritiesLabel.setText("Priority zones   |   Value, range (8:10) or *", juce::dontSendNotification);
+        prioritiesLabel.setText("Priority takes   |   Exact value, range (8:10) or blank", juce::dontSendNotification);
         for (auto* label : {&controlsLabel, &prioritiesLabel})
             label->setFont(juce::FontOptions(16.0f, juce::Font::bold));
-        for (auto* button : {&createButton, &recordButton, &exportButton})
-        {
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour(accent));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour(background));
-        }
+        nextButton.setColour(juce::TextButton::buttonColourId, juce::Colour(accent));
+        nextButton.setColour(juce::TextButton::textColourOffId, juce::Colour(background));
+        deviceSummary.setColour(juce::Label::textColourId, muted);
         countsLabel.setText("Training takes                Test takes", juce::dontSendNotification);
         routingLabel.setText("Loopback input", juce::dontSendNotification);
+        ampOutputLabel.setText("Amp output", juce::dontSendNotification);
+        deviceSummary.setMinimumHorizontalScale(0.92f);
         sendLabel.setText("Send dB", juce::dontSendNotification);
 
         name.setTextToShowWhenEmpty("e.g. Tube Combo", juce::Colours::grey);
         name.setExplicitFocusOrder(1);
-        controls.setHeadings({"ID", "Name", "Min", "Max", "Step", "Model min", "Model max"});
+        controls.setHeadings({"ID", "Name", "Min", "Max", "Dial step", "Model min", "Model max"});
         controls.addRow({"gain", "Gain", "0", "10", "0.5", "0", "1"});
         controls.addRow({"treble", "Treble", "0", "10", "0.5", "0", "1"});
         controls.addRow({"mid", "Middle", "0", "10", "0.5", "0", "1"});
         controls.addRow({"bass", "Bass", "0", "10", "0.5", "0", "1"});
         priorities.placeholders = true;
+        stepHint.setText("Dial step is the distance between automatic positions. E.g. 0.5 gives 2, 2.5, 3...", juce::dontSendNotification);
+        stepHint.setColour(juce::Label::textColourId, muted);
+        budgetSummary.setColour(juce::Label::textColourId, muted);
+        priorities.onChange = [this] { updateBudget(); };
         controls.onChange = [this] { updatePriorityColumns(); };
         controls.onRemove = [this](int row) { priorities.removeColumn(row + 1); };
         updatePriorityColumns();
@@ -110,40 +119,53 @@ public:
         trainCount.setText("30");
         testCount.setInputRestrictions(4, "0123456789");
         testCount.setText("10");
+        trainCount.onTextChange = testCount.onTextChange = [this] { updateBudget(); };
+        updateBudget();
         sendLevel.setInputRestrictions(6, "-0123456789.");
-        sendLevel.setText("-18");
-        sendLevel.onReturnKey = sendLevel.onFocusLost = [this] { applySend(); };
-        loopInput.addItem("First active input", 1);
-        loopInput.addItem("Second active input", 2);
-        loopInput.setSelectedId(1);
-        loopInput.onChange = [this] { calibratedNow = false; update(); };
+        sendLevel.setText("0");
+        sendLevel.onReturnKey = sendLevel.onFocusLost = [this] { run([this] { applySend(); }); };
+        loopInput.onChange = [this] { levelCheck = LevelCheck::loud; refreshAudioChannels(); };
+        ampOutput.onChange = [this] { levelCheck = LevelCheck::loud; refreshAudioChannels(); };
 
-        stimulusName.setText("Built-in 12 s test signal", juce::dontSendNotification);
+        const auto executable = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
+#if JUCE_MAC
+        const auto resources = executable.getParentDirectory().getParentDirectory().getChildFile("Resources");
+#else
+        const auto resources = executable.getParentDirectory();
+#endif
+        try
+        {
+            stimulus = capture::readWav(resources.getChildFile("CaptureStimulus.wav"));
+            stimulusName.setText("Standard stimulus  /  90 s", juce::dontSendNotification);
+        }
+        catch (const std::exception&)
+        {
+            stimulusName.setText("Standard WAV unavailable. Import a stimulus.", juce::dontSendNotification);
+        }
         list.setRowHeight(34);
         list.setColour(juce::ListBox::backgroundColourId, juce::Colour(0xff202834));
         list.setMultipleSelectionEnabled(false);
         progressBar.setPercentageDisplay(true);
 
-        deviceButton.onClick = [this] { chooseDevice(); };
-        planTab.onClick = [this] { showCapture(false); };
-        recordTab.onClick = [this] { showCapture(true); };
-        stimulusButton.onClick = [this] { chooseStimulus(); };
-        createButton.onClick = [this] { createSession(); };
-        openButton.onClick = [this] { openSession(); };
-        calibrateButton.onClick = [this] { start(true); };
-        recordButton.onClick = [this] { start(false); };
-        cancelButton.onClick = [this] { cancel(); };
-        exportButton.onClick = [this]
+        wiringButton.onClick = []
         {
-            run([this]
-            {
-                session->exportDataset(normalise.getToggleState());
-                status("Exported dataset/manifest.json and dataset/profile.json.");
-            });
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Connect your amplifier",
+                "1. Send: interface line output to a reamp box, then to the amp input.\n"
+                "2. Loopback: a second output can go straight to a line input. With one output, split the line signal or use the interface's internal loopback.\n"
+                "3. Mic: place a microphone at the speaker and connect it to a mic input.\n\n"
+                "Keep the speaker or rated load connected. Never connect a speaker output to the interface.\n\n"
+                "In Audio setup enable two inputs and one or two outputs. Choose the loopback input and amp output. Capture sets 48 kHz. "
+                "Set the amp to its loudest planned setting and calibrate. Adjust gains for headroom, then keep them fixed.",
+                "OK");
         };
+        stimulusButton.onClick = [this] { chooseStimulus(); };
+        openButton.onClick = [this] { openSession(); };
+        nextButton.onClick = [this] { advance(); };
+        backButton.onClick = [this] { goBack(); };
+        cancelButton.onClick = [this] { cancel(); };
 
-        showCapture(false);
-        setSize(960, 760);
+        showStep(Step::audio);
+        setSize(960, 700);
         startTimerHz(15);
 
         const auto safe = juce::Component::SafePointer<CaptureView>(this);
@@ -161,6 +183,9 @@ public:
             safe->callbackInstalled = true;
             if (error.isNotEmpty())
                 safe->status(error);
+            else
+                safe->forceSampleRate();
+            safe->refreshAudioChannels();
         });
     }
 
@@ -179,85 +204,133 @@ public:
         graphics.fillAll();
         graphics.setColour(line);
         graphics.fillRect(navigationDivider);
-        if (selectedTake.isVisible())
+        if (step == Step::calibration || step == Step::record)
         {
             drawMeter(graphics, loopMeterArea, "Loopback", loopMeter);
             drawMeter(graphics, micMeterArea, "Mic", micMeter);
         }
+        if (step == Step::record && session && list.getSelectedRow() >= 0
+            && list.getSelectedRow() < static_cast<int>(session->points.size()))
+            drawTakeSettings(graphics);
     }
 
     void resized() override
     {
         auto area = getLocalBounds().reduced(24);
-        auto header = area.removeFromTop(43);
-        deviceButton.setBounds(header.removeFromRight(142).withHeight(34));
+        auto header = area.removeFromTop(44);
+        wiringButton.setBounds(header.removeFromRight(112).withHeight(34));
         title.setBounds(header);
-        subtitle.setBounds(area.removeFromTop(25));
-        area.removeFromTop(12);
-        auto navigation = area.removeFromTop(36);
-        planTab.setBounds(navigation.removeFromLeft(118));
-        navigation.removeFromLeft(8);
-        recordTab.setBounds(navigation.removeFromLeft(118));
-        openButton.setBounds(navigation.removeFromRight(142));
-        const auto gap = area.removeFromTop(12);
+        subtitle.setBounds(area.removeFromTop(27));
+        auto gap = area.removeFromTop(14);
         navigationDivider = gap.withY(gap.getCentreY()).withHeight(1);
-        auto foot = area.removeFromBottom(52);
-        progressBar.setBounds(foot.removeFromBottom(15));
-        statusLabel.setBounds(foot);
+
+        auto actions = area.removeFromBottom(42);
+        nextButton.setBounds(actions.removeFromRight(164));
+        actions.removeFromRight(10);
+        cancelButton.setBounds(actions.removeFromRight(94));
+        backButton.setBounds(actions.removeFromLeft(84));
+        actions.removeFromLeft(10);
+        openButton.setBounds(actions.removeFromLeft(128));
+        auto feedback = area.removeFromBottom(43);
+        progressBar.setBounds(feedback.removeFromBottom(11));
+        statusLabel.setBounds(feedback);
         area.removeFromBottom(8);
 
-        auto planArea = area;
-        nameLabel.setBounds(planArea.removeFromTop(22));
-        name.setBounds(planArea.removeFromTop(30));
-        planArea.removeFromTop(6);
-        auto controlHeader = planArea.removeFromTop(30);
-        addControl.setBounds(controlHeader.removeFromRight(110));
-        controlsLabel.setBounds(controlHeader);
-        planArea.removeFromTop(4);
-        controls.setBounds(planArea.removeFromTop(std::min(165, std::max(102, getHeight() - 575))));
-        planArea.removeFromTop(6);
-        auto priorityHeader = planArea.removeFromTop(30);
-        addPriority.setBounds(priorityHeader.removeFromRight(110));
-        prioritiesLabel.setBounds(priorityHeader);
-        planArea.removeFromTop(4);
-        priorities.setBounds(planArea.removeFromTop(90));
-        planArea.removeFromTop(6);
-        countsLabel.setBounds(planArea.removeFromTop(22));
-        auto counts = planArea.removeFromTop(30);
-        trainCount.setBounds(counts.removeFromLeft(134).withTrimmedRight(14));
-        testCount.setBounds(counts.removeFromLeft(118));
-        planArea.removeFromTop(8);
-        auto create = planArea.removeFromTop(34);
-        stimulusButton.setBounds(create.removeFromLeft(140));
-        createButton.setBounds(create.removeFromRight(142));
-        stimulusName.setBounds(create.reduced(8, 0));
+        planViewport.setBounds(area);
+        layoutPlan(std::max(1, area.getWidth() - planViewport.getScrollBarThickness()));
 
-        auto recordArea = area;
-        sessionTitle.setBounds(recordArea.removeFromTop(34));
-        auto setup = recordArea.removeFromTop(32);
-        routingLabel.setBounds(setup.removeFromLeft(117));
-        loopInput.setBounds(setup.removeFromLeft(170));
-        setup.removeFromLeft(20);
-        sendLabel.setBounds(setup.removeFromLeft(72));
-        sendLevel.setBounds(setup.removeFromLeft(75));
-        setup.removeFromLeft(20);
-        loopMeterArea = setup.removeFromLeft(setup.getWidth() / 2).reduced(6, 1);
-        micMeterArea = setup.reduced(6, 1);
-        recordArea.removeFromTop(8);
-        selectedTake.setBounds(recordArea.removeFromTop(30));
-        auto actions = recordArea.removeFromBottom(36);
-        calibrateButton.setBounds(actions.removeFromLeft(122));
-        actions.removeFromLeft(8);
-        recordButton.setBounds(actions.removeFromLeft(132));
-        actions.removeFromLeft(8);
-        cancelButton.setBounds(actions.removeFromLeft(100));
-        exportButton.setBounds(actions.removeFromRight(142));
-        normalise.setBounds(actions.removeFromRight(169));
-        recordArea.removeFromBottom(8);
-        list.setBounds(recordArea);
+        auto audioArea = area;
+        deviceSummary.setBounds(audioArea.removeFromBottom(34));
+        auto roles = audioArea.removeFromBottom(32);
+        routingLabel.setBounds(roles.removeFromLeft(114));
+        loopInput.setBounds(roles.removeFromLeft(196));
+        roles.removeFromLeft(16);
+        ampOutputLabel.setBounds(roles.removeFromLeft(88));
+        ampOutput.setBounds(roles.removeFromLeft(196));
+        audioViewport.setBounds(audioArea.withTrimmedBottom(8));
+        audioSelector.setSize(std::max(1, audioViewport.getWidth() - audioViewport.getScrollBarThickness()), 480);
+
+        sessionTitle.setBounds(area.removeFromTop(40));
+        auto meters = area.removeFromTop(36);
+        sendLabel.setBounds(meters.removeFromLeft(80));
+        sendLevel.setBounds(meters.removeFromLeft(72));
+        meters.removeFromLeft(12);
+        loopMeterArea = meters.removeFromLeft(meters.getWidth() / 2).reduced(8, 2);
+        micMeterArea = meters.reduced(8, 2);
+        selectedTake.setBounds(area.removeFromTop(40));
+        normalise.setBounds(area.removeFromTop(33));
+        list.setBounds(area.withTrimmedTop(6));
+        takeSettingsArea = {};
+        if (step == Step::record)
+        {
+            takeSettingsArea = normalise.getBounds().withHeight(56);
+            area.removeFromTop(29);
+            list.setBounds(area);
+        }
     }
 
 private:
+    enum class Step { audio, plan, calibration, record, exportData, done };
+    enum class LevelCheck { loud, quiet, complete };
+
+    std::array<juce::Component*, 15> planFields()
+    {
+        return {&nameLabel, &name, &controlsLabel, &controls, &stepHint, &addControl,
+                &prioritiesLabel, &priorities, &addPriority, &countsLabel, &trainCount, &testCount,
+                &budgetSummary, &stimulusButton, &stimulusName};
+    }
+
+    void layoutPlan(int width)
+    {
+        planContent.setSize(width, 490);
+        auto area = planContent.getLocalBounds().withTrimmedRight(6);
+        nameLabel.setBounds(area.removeFromTop(22));
+        name.setBounds(area.removeFromTop(30));
+        area.removeFromTop(8);
+        auto header = area.removeFromTop(30);
+        addControl.setBounds(header.removeFromRight(110));
+        controlsLabel.setBounds(header);
+        area.removeFromTop(4);
+        controls.setBounds(area.removeFromTop(156));
+        stepHint.setBounds(area.removeFromTop(23));
+        header = area.removeFromTop(30);
+        addPriority.setBounds(header.removeFromRight(110));
+        prioritiesLabel.setBounds(header);
+        area.removeFromTop(4);
+        priorities.setBounds(area.removeFromTop(83));
+        area.removeFromTop(8);
+        countsLabel.setBounds(area.removeFromTop(22));
+        auto counts = area.removeFromTop(30);
+        trainCount.setBounds(counts.removeFromLeft(134).withTrimmedRight(14));
+        testCount.setBounds(counts.removeFromLeft(118));
+        budgetSummary.setBounds(counts.withTrimmedLeft(12));
+        area.removeFromTop(8);
+        auto stimulusRow = area.removeFromTop(32);
+        stimulusButton.setBounds(stimulusRow.removeFromLeft(140));
+        stimulusName.setBounds(stimulusRow.reduced(8, 0));
+    }
+
+    void drawTakeSettings(juce::Graphics& g)
+    {
+        const auto& point = session->points[static_cast<size_t>(list.getSelectedRow())];
+        auto area = takeSettingsArea;
+        const auto width = area.getWidth() / static_cast<int>(session->controls.size());
+        for (size_t i = 0; i < session->controls.size(); ++i)
+        {
+            auto card = area.removeFromLeft(width).withTrimmedRight(6);
+            g.setColour(juce::Colour(0xff182238));
+            g.fillRoundedRectangle(card.toFloat().withTrimmedBottom(5), 7.0f);
+            card = card.reduced(7, 3);
+            g.setColour(muted);
+            g.setFont(12.0f);
+            g.drawFittedText(session->controls[i].label, card.removeFromTop(18), juce::Justification::centred, 1);
+            g.setColour(juce::Colour(accent));
+            g.setFont(juce::FontOptions(19.0f, juce::Font::bold));
+            const auto value = juce::String(point.dials[i], 3).trimCharactersAtEnd("0").trimCharactersAtEnd(".");
+            g.drawFittedText(value, card, juce::Justification::centredTop, 1);
+        }
+    }
+
     void drawMeter(juce::Graphics& g, juce::Rectangle<int> meter, const juce::String& label, float peak)
     {
         const auto db = juce::Decibels::gainToDecibels(peak, -60.0f);
@@ -274,28 +347,200 @@ private:
         g.fillRoundedRectangle(track.withWidth(track.getWidth() * juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f)), 2.5f);
     }
 
-    void status(const juce::String& text) { statusLabel.setText(text, juce::dontSendNotification); }
+    void status(const juce::String& text, bool problem = false)
+    {
+        statusLabel.setColour(juce::Label::textColourId, problem ? juce::Colour(0xffffad96) : juce::Colour(accent));
+        statusLabel.setText(text, juce::dontSendNotification);
+    }
     void run(const std::function<void()>& operation)
     {
         try { operation(); }
-        catch (const std::exception& error) { status(juce::String::fromUTF8(error.what())); }
+        catch (const std::exception& error) { status(juce::String::fromUTF8(error.what()), true); }
         update();
     }
 
-    void showCapture(bool capturePage)
+    void showStep(Step next)
     {
-        for (auto* component : std::initializer_list<juce::Component*>{
-                 &nameLabel, &name, &controlsLabel, &controls, &addControl, &prioritiesLabel, &priorities, &addPriority,
-                 &countsLabel, &trainCount, &testCount, &stimulusButton, &stimulusName, &createButton})
-            component->setVisible(!capturePage);
-        for (auto* component : std::initializer_list<juce::Component*>{
-                 &sessionTitle, &routingLabel, &loopInput, &sendLabel, &sendLevel, &selectedTake, &list,
-                 &calibrateButton, &recordButton, &cancelButton, &normalise, &exportButton, &progressBar})
-            component->setVisible(capturePage);
-        subtitle.setText(capturePage ? "Calibrate and record" : "Plan your capture", juce::dontSendNotification);
-        planTab.setToggleState(!capturePage, juce::dontSendNotification);
-        recordTab.setToggleState(capturePage, juce::dontSendNotification);
+        step = next;
+        const bool audio = step == Step::audio;
+        const bool calibration = step == Step::calibration;
+        const bool recording = step == Step::record;
+        const bool exporting = step == Step::exportData;
+        audioViewport.setVisible(audio);
+        routingLabel.setVisible(audio);
+        loopInput.setVisible(audio);
+        ampOutputLabel.setVisible(audio);
+        ampOutput.setVisible(audio);
+        deviceSummary.setVisible(audio);
+        planViewport.setVisible(step == Step::plan);
+        sessionTitle.setVisible(calibration || recording || exporting || step == Step::done);
+        sendLabel.setVisible(calibration);
+        sendLevel.setVisible(calibration);
+        selectedTake.setVisible(calibration || recording || exporting || step == Step::done);
+        list.setVisible(recording);
+        normalise.setVisible(exporting);
+        backButton.setVisible(step != Step::audio);
+        openButton.setVisible(audio);
+        const juce::StringArray titles{
+            "1 / 5   Audio setup", "2 / 5   Capture plan", "3 / 5   Calibrate levels",
+            "4 / 5   Record takes", "5 / 5   Export dataset", "Capture complete"};
+        subtitle.setText(titles[static_cast<int>(step)], juce::dontSendNotification);
+        status("");
+        if (audio)
+            refreshAudioChannels();
+        resized();
         update();
+        repaint();
+    }
+
+    bool audioReady() const
+    {
+        const auto* device = devices.getCurrentAudioDevice();
+        if (!callbackInstalled || !device || device->getActiveInputChannels().countNumberOfSetBits() != 2)
+            return false;
+        const int outputs = device->getActiveOutputChannels().countNumberOfSetBits();
+        return outputs >= 1 && outputs <= 2 && loopInput.getSelectedId() != 0 && ampOutput.getSelectedId() != 0;
+    }
+
+    bool forceSampleRate()
+    {
+        auto* device = devices.getCurrentAudioDevice();
+        if (device == nullptr)
+            return false;
+        if (device->getCurrentSampleRate() == capture::sampleRate)
+            return true;
+        if (!device->getAvailableSampleRates().contains(capture::sampleRate))
+        {
+            status("This device does not offer 48 kHz. Choose a different device or set its driver to 48 kHz.");
+            return false;
+        }
+        auto setup = devices.getAudioDeviceSetup();
+        setup.sampleRate = capture::sampleRate;
+        const auto error = devices.setAudioDeviceSetup(setup, true);
+        if (error.isNotEmpty())
+        {
+            status("Could not set 48 kHz. " + error);
+            return false;
+        }
+        device = devices.getCurrentAudioDevice();
+        if (device == nullptr || device->getCurrentSampleRate() != capture::sampleRate)
+        {
+            status("The driver did not switch to 48 kHz. Set its sample rate in the driver settings.");
+            return false;
+        }
+        return true;
+    }
+
+    void refreshAudioChannels()
+    {
+        auto* device = devices.getCurrentAudioDevice();
+        juce::StringArray active, sends;
+        if (device)
+        {
+            const auto names = device->getInputChannelNames();
+            const auto enabled = device->getActiveInputChannels();
+            for (int i = 0; i < names.size(); ++i)
+                if (enabled[i])
+                    active.add(names[i]);
+            const auto outputs = device->getOutputChannelNames();
+            const auto enabledOutputs = device->getActiveOutputChannels();
+            for (int i = 0; i < outputs.size(); ++i)
+                if (enabledOutputs[i])
+                    sends.add(outputs[i]);
+        }
+        if (active != activeInputs)
+        {
+            const auto oldName = loopInput.getText();
+            activeInputs = active;
+            loopInput.clear(juce::dontSendNotification);
+            for (int i = 0; i < active.size(); ++i)
+                loopInput.addItem(active[i], i + 1);
+            const auto restored = active.indexOf(oldName);
+            if (restored >= 0)
+                loopInput.setSelectedId(restored + 1, juce::dontSendNotification);
+        }
+        if (sends != activeOutputs)
+        {
+            const auto previous = ampOutput.getText();
+            activeOutputs = sends;
+            ampOutput.clear(juce::dontSendNotification);
+            for (int i = 0; i < sends.size(); ++i)
+                ampOutput.addItem(sends[i], i + 1);
+            if (!sends.isEmpty())
+                ampOutput.setSelectedId(std::max(0, sends.indexOf(previous)) + 1, juce::dontSendNotification);
+        }
+        const int loop = loopInput.getSelectedId();
+        const int amp = ampOutput.getSelectedId();
+        if (audioReady() && active.size() == 2 && amp <= sends.size())
+        {
+            const auto returnRoute = sends.size() == 2
+                ? sends[2 - amp] + " -> " + active[loop - 1]
+                : "internal or split -> " + active[loop - 1];
+            deviceSummary.setText("Amp: " + sends[amp - 1] + "   |   Loopback: " + returnRoute
+                                  + "   |   Mic: " + active[2 - loop], juce::dontSendNotification);
+        }
+        else
+        {
+            deviceSummary.setText("Enable two inputs and one or two outputs above, then choose which input is loopback.",
+                                  juce::dontSendNotification);
+        }
+        update();
+    }
+
+    void advance()
+    {
+        if (pending)
+            return;
+        switch (step)
+        {
+            case Step::audio:
+                if (audioReady() && forceSampleRate() && audioReady())
+                    showStep(session ? (allRecorded() ? Step::exportData : Step::calibration) : Step::plan);
+                break;
+            case Step::plan: createSession(); break;
+            case Step::calibration:
+                if (levelCheck == LevelCheck::complete)
+                    showStep(Step::record);
+                else
+                    start(true);
+                break;
+            case Step::record: start(false); break;
+            case Step::exportData:
+                run([this]
+                {
+                    session->exportDataset(normalise.getToggleState());
+                    showStep(Step::done);
+                    status("Upload the dataset folder to Drive for Colab.");
+                });
+                break;
+            case Step::done:
+                session->folder.getChildFile("dataset").revealToUser();
+                break;
+        }
+    }
+
+    void goBack()
+    {
+        if (pending)
+            return;
+        if (step == Step::done || step == Step::exportData)
+        {
+            showStep(levelCheck == LevelCheck::complete ? Step::record : Step::calibration);
+            return;
+        }
+        if (step == Step::record)
+        {
+            levelCheck = LevelCheck::loud;
+            showStep(Step::calibration);
+            return;
+        }
+        levelCheck = LevelCheck::loud;
+        showStep(Step::audio);
+    }
+
+    bool allRecorded() const
+    {
+        return session && session->completed() == static_cast<int>(session->points.size());
     }
 
     void updatePriorityColumns()
@@ -311,22 +556,16 @@ private:
         addPriority.setEnabled(controls.size() > 0);
     }
 
-    void chooseDevice()
+    void updateBudget()
     {
-        calibratedNow = false;
-        update();
-        auto selector = std::make_unique<juce::AudioDeviceSelectorComponent>(devices, 0, 2, 0, 1, false, false, false, false);
-        selector->setSize(560, 400);
-        juce::DialogWindow::LaunchOptions options;
-        options.dialogTitle = "Audio device and channels";
-        options.dialogBackgroundColour = juce::Colour(background);
-        options.content.setOwned(selector.release());
-        options.componentToCentreAround = this;
-        options.escapeKeyTriggersCloseButton = true;
-        options.useNativeTitleBar = true;
-        options.resizable = true;
-        options.launchAsync();
-        status("Select 48 kHz, two input channels and one send output.");
+        int reserved = 0;
+        for (int row = 0; row < priorities.size(); ++row)
+            reserved += juce::jlimit(0, 2000, priorities.value(row, 0).getIntValue());
+        const int total = trainCount.getText().getIntValue();
+        const int tests = testCount.getText().getIntValue();
+        budgetSummary.setText(reserved > total ? "Priority takes exceed the training total"
+            : juce::String(reserved) + " priority + " + juce::String(total - reserved) + " automatic + "
+                                      + juce::String(tests) + " test", juce::dontSendNotification);
     }
 
     void choose(const juce::String& titleText, const juce::String& pattern, int flags,
@@ -356,6 +595,8 @@ private:
     {
         run([this]
         {
+            if (stimulus.empty())
+                throw std::runtime_error("Import a mono 48 kHz WAV before continuing.");
             auto settings = capture::parseControls(controls.text());
             auto prioritiesParsed = capture::parsePriorities(priorities.text("*"), settings);
             auto points = capture::plan(settings, prioritiesParsed, trainCount.getText().getIntValue(), testCount.getText().getIntValue());
@@ -363,7 +604,7 @@ private:
                    juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
                    [settings = std::move(settings), points = std::move(points)](CaptureView& view, const juce::File& file)
             {
-                view.setSession(capture::Session::create(file, view.name.getText(), settings, points, view.stimulus, -18.0));
+                view.setSession(capture::Session::create(file, view.name.getText(), settings, points, view.stimulus, 0.0));
             });
         });
     }
@@ -374,44 +615,35 @@ private:
                juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
                [](CaptureView& view, const juce::File& file)
         {
-            view.setSession(capture::Session::open(file.getParentDirectory()));
+            view.setSession(capture::Session::open(file.getParentDirectory()), true);
         });
     }
 
-    void setSession(capture::Session next)
+    void setSession(capture::Session next, bool opened = false)
     {
         auto samples = next.stimulus();
         session = std::move(next);
         sessionStimulus = std::move(samples);
+        calibrationExcerpt = capture::calibrationWindow(sessionStimulus);
         sendLevel.setText(juce::String(session->sendDb, 1), false);
-        calibratedNow = false;
+        levelCheck = LevelCheck::loud;
         loopMeter = micMeter = 0.0f;
         list.updateContent();
         selectNext();
-        showCapture(true);
-        status("Set the amplifier to its loudest condition, then calibrate.");
+        showStep(opened ? Step::audio : Step::calibration);
     }
 
     void applySend()
     {
         if (!session || pending)
             return;
-        run([&]
+        const auto db = capture::parseNumber(sendLevel.getText());
+        if (db != session->sendDb)
         {
-            const auto text = sendLevel.getText().trim().toStdString();
-            size_t parsed = 0;
-            if (text.empty() || text.find_first_of("0123456789") == std::string::npos)
-                throw std::runtime_error("Enter a send level between -60 and 0 dB.");
-            const auto db = std::stod(text, &parsed);
-            if (parsed != text.size())
-                throw std::runtime_error("Enter a send level between -60 and 0 dB.");
-            if (db != session->sendDb)
-            {
-                session->setSendDb(db);
-                calibratedNow = false;
-                status("Send level changed. Calibrate again.");
-            }
-        });
+            session->setSendDb(db);
+            levelCheck = LevelCheck::loud;
+            status("Send level changed. Calibrate again.");
+        }
         sendLevel.setText(juce::String(session->sendDb, 1), false);
     }
 
@@ -421,16 +653,25 @@ private:
         {
             if (!session || pending || !callbackInstalled)
                 throw std::runtime_error("Open a session and configure the audio device first.");
-            applySend();
+            if (!audioReady() || devices.getCurrentAudioDevice()->getCurrentSampleRate() != capture::sampleRate)
+            {
+                levelCheck = LevelCheck::loud;
+                showStep(Step::audio);
+                throw std::runtime_error("Audio routing changed. Set up the device again before recording.");
+            }
+            if (calibration)
+                applySend();
             const auto row = list.getSelectedRow();
-            if (!calibration && (!calibratedNow || row < 0))
+            if (!calibration && (levelCheck != LevelCheck::complete || row < 0))
                 throw std::runtime_error("Calibrate and select a take first.");
             const int loop = loopInput.getSelectedId() - 1;
-            recorder.start(sessionStimulus, juce::Decibels::decibelsToGain(float(session->sendDb)), loop, 1 - loop);
+            const auto source = std::span<const float>(sessionStimulus);
+            const auto playback = calibration ? source.subspan(calibrationExcerpt.start, calibrationExcerpt.length) : source;
+            recorder.start(playback, juce::Decibels::decibelsToGain(float(session->sendDb)), loop, 1 - loop);
             captureIndex = calibration ? -1 : row;
             pending = true;
             progress = 0;
-            status(calibration ? "Recording calibration..." : "Recording " + session->pointLabel(size_t(row)));
+            status(calibration ? "Playing the loudest excerpt..." : "Recording " + session->pointLabel(size_t(row)));
         });
     }
 
@@ -449,6 +690,8 @@ private:
 
     void timerCallback() override
     {
+        if (step == Step::audio)
+            refreshAudioChannels();
         if (!pending)
             return;
         progress = recorder.progress();
@@ -459,7 +702,7 @@ private:
         if (recorder.failed())
         {
             pending = false;
-            calibratedNow = false;
+            levelCheck = LevelCheck::loud;
             status("Audio device stopped or its channels changed. Check routing and recalibrate.");
             update();
             return;
@@ -469,23 +712,59 @@ private:
             pending = false;
             run([&]
             {
-                const auto analysed = capture::analyse(*recording, int(sessionStimulus.size()), 0.3f);
+                capture::Analysed analysed;
+                try
+                {
+                    const auto length = captureIndex < 0 ? calibrationExcerpt.length : sessionStimulus.size();
+                    analysed = capture::analyse(*recording, int(length));
+                }
+                catch (const capture::LoopbackSyncError& error)
+                {
+                    loopMeter = error.loopPeak;
+                    micMeter = error.micPeak;
+                    repaint(loopMeterArea.getUnion(micMeterArea));
+                    const auto input = loopInput.getText();
+                    const int amp = ampOutput.getSelectedId();
+                    const auto source = activeOutputs.size() == 2 && amp > 0
+                        ? " Connect " + activeOutputs[2 - amp] + " to " + input + "."
+                        : " Check the internal loopback or line split feeding " + input + ".";
+                    const auto reason = error.loopPeak < 0.003f
+                        ? "No usable signal on " + input + "."
+                        : "Signal on " + input + ", but no sync marker. Check that this is the loopback, not the mic.";
+                    status(reason + source, true);
+                    return;
+                }
                 loopMeter = analysed.loopPeak;
                 micMeter = analysed.micPeak;
                 repaint(loopMeterArea.getUnion(micMeterArea));
-                if (captureIndex < 0)
+                if (captureIndex < 0 && levelCheck == LevelCheck::loud)
                 {
-                    calibratedNow = false;
-                    session->calibrate(*recording, analysed);
-                    calibratedNow = true;
+                    session->calibrate(*recording, analysed, calibrationExcerpt.start);
+                    levelCheck = LevelCheck::quiet;
+                    const auto micDb = juce::Decibels::gainToDecibels(analysed.micPeak);
+                    status("Loud check: mic peak " + juce::String(micDb, 1)
+                           + " dBFS. Now set the amp to its quietest setting.", micDb > -3.0f);
+                }
+                else if (captureIndex < 0)
+                {
+                    const auto snr = session->checkQuiet(*recording, analysed, calibrationExcerpt.start);
+                    levelCheck = LevelCheck::complete;
+                    if (!snr)
+                        status("Quiet check finished. Could not estimate the mic noise floor.", true);
+                    else if (*snr < 20.0)
+                        status("Quiet check: estimated SNR " + juce::String(*snr, 1)
+                               + " dB. The quiet setting may be close to the noise floor.", true);
+                    else
+                        status("Quiet check passed. Estimated mic SNR: " + juce::String(*snr, 1) + " dB.");
                 }
                 else
                 {
                     session->saveTake(size_t(captureIndex), *recording, analysed);
                     selectNext();
+                    if (allRecorded())
+                        showStep(Step::exportData);
+                    status("Take saved   |   Loop delay " + juce::String(analysed.delay) + " samples");
                 }
-                status((captureIndex < 0 ? juce::String("Calibrated") : juce::String("Take saved"))
-                    + "   |   Loop delay " + juce::String(analysed.delay) + " samples");
             });
         }
     }
@@ -506,27 +785,40 @@ private:
         sessionTitle.setText(ready ? session->amplifier + "   |   " + juce::String(session->completed()) + " / "
                                    + juce::String(int(session->points.size())) + " takes" : "No session",
                              juce::dontSendNotification);
-        deviceButton.setEnabled(!pending);
-        planTab.setEnabled(!pending);
-        recordTab.setEnabled(ready && !pending);
         openButton.setEnabled(!pending);
         list.setEnabled(!pending);
         list.repaint();
-        loopInput.setEnabled(!pending);
+        loopInput.setEnabled(activeInputs.size() == 2 && !pending);
+        ampOutput.setEnabled(activeOutputs.size() == 2 && !pending);
         sendLevel.setEnabled(ready && !pending && session->completed() == 0);
-        calibrateButton.setEnabled(ready && !pending);
+        backButton.setEnabled(!pending);
+        cancelButton.setVisible(pending);
+        progressBar.setVisible(pending);
         const int row = list.getSelectedRow();
         const bool validRow = ready && row >= 0 && row < int(session->points.size());
-        selectedTake.setText(validRow ? session->pointLabel(size_t(row)) : "Select a take", juce::dontSendNotification);
-        recordButton.setEnabled(validRow && calibratedNow && !pending);
-        recordButton.setButtonText(validRow && session->points[size_t(row)].recording.isNotEmpty() ? "Retake" : "Record take");
-        cancelButton.setEnabled(pending);
-        normalise.setEnabled(!pending);
-        exportButton.setEnabled(ready && !pending && session->completed() == int(session->points.size()));
+        const bool retake = validRow && session->points[size_t(row)].recording.isNotEmpty();
+        if (step == Step::calibration)
+            selectedTake.setText(levelCheck == LevelCheck::complete ? "Checks complete. Continue to the first take."
+                : levelCheck == LevelCheck::quiet ? "Set the amp to its quietest planned setting. Keep interface gains fixed."
+                : "Set the amp to its loudest planned setting to check headroom.", juce::dontSendNotification);
+        else if (step == Step::record)
+            selectedTake.setText(validRow ? "Take " + juce::String(row + 1) + " / "
+                                          + juce::String(int(session->points.size())) + "   |   Set the knobs below"
+                                          : "Select a take", juce::dontSendNotification);
+        else
+            selectedTake.setText(step == Step::done ? "Dataset exported" : "All takes are saved. Export the dataset for Colab.",
+                                 juce::dontSendNotification);
+
+        nextButton.setButtonText(step == Step::calibration && levelCheck != LevelCheck::complete
+            ? (levelCheck == LevelCheck::loud ? "Check loud setting" : "Check quiet setting")
+            : step == Step::record ? (retake ? "Retake" : "Record take")
+            : step == Step::exportData ? "Export dataset" : step == Step::done ? "Open dataset folder" : "Next");
+        nextButton.setEnabled(!pending && (step != Step::audio || audioReady())
+                              && (step != Step::record || (validRow && levelCheck == LevelCheck::complete)));
     }
 
     int getNumRows() override { return session ? int(session->points.size()) : 0; }
-    void selectedRowsChanged(int) override { update(); }
+    void selectedRowsChanged(int) override { update(); repaint(takeSettingsArea); }
 
     void paintListBoxItem(int row, juce::Graphics& graphics, int width, int height, bool selected) override
     {
@@ -550,26 +842,31 @@ private:
     CaptureTheme theme;
     capture::Recorder recorder;
     juce::AudioDeviceManager devices;
+    juce::AudioDeviceSelectorComponent audioSelector;
+    juce::Component planContent;
+    juce::Viewport planViewport, audioViewport;
+    juce::StringArray activeInputs, activeOutputs;
+    Step step = Step::audio;
     std::optional<capture::Session> session;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::Label title, subtitle, nameLabel, controlsLabel, prioritiesLabel, countsLabel,
-                stimulusName, sessionTitle, routingLabel, sendLabel, statusLabel, selectedTake;
+                stimulusName, sessionTitle, routingLabel, ampOutputLabel, sendLabel, statusLabel, selectedTake, stepHint, budgetSummary, deviceSummary;
     juce::TextEditor name, trainCount, testCount, sendLevel;
     PlanGrid controls, priorities;
-    juce::ComboBox loopInput;
-    juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"},
-                     deviceButton{"Audio setup"}, planTab{"Plan session"}, recordTab{"Record"},
-                     stimulusButton{"Import stimulus"}, createButton{"Create session"}, openButton{"Open session"},
-                     calibrateButton{"Calibrate"}, recordButton{"Record take"}, cancelButton{"Cancel"},
-                     exportButton{"Export dataset"};
+    juce::ComboBox loopInput, ampOutput;
+    juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"}, wiringButton{"Wiring guide"},
+                     stimulusButton{"Import stimulus"}, openButton{"Open session"},
+                     nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"};
     juce::ToggleButton normalise{"Normalise to -3 dBFS"};
     juce::ListBox list;
     std::vector<float> stimulus, sessionStimulus;
-    juce::Rectangle<int> navigationDivider, loopMeterArea, micMeterArea;
+    capture::StimulusWindow calibrationExcerpt;
+    juce::Rectangle<int> navigationDivider, loopMeterArea, micMeterArea, takeSettingsArea;
     float loopMeter = 0.0f, micMeter = 0.0f;
     double progress = 0;
     juce::ProgressBar progressBar;
-    bool callbackInstalled = false, pending = false, calibratedNow = false;
+    bool callbackInstalled = false, pending = false;
+    LevelCheck levelCheck = LevelCheck::loud;
     int captureIndex = -1;
 };
 
@@ -580,7 +877,7 @@ public:
     {
         setUsingNativeTitleBar(true);
         setResizable(true, false);
-        setResizeLimits(760, 720, 1600, 1100);
+        setResizeLimits(740, 490, 1600, 1100);
         setContentOwned(new CaptureView(), true);
         centreWithSize(getWidth(), getHeight());
         setVisible(true);

@@ -33,3 +33,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         endif()
     endif()
 endif()
+
+set(CAPTURE_STIMULUS "${CMAKE_CURRENT_SOURCE_DIR}/Resources/CaptureStimulus.wav")
+if(APPLE)
+    set_source_files_properties("${CAPTURE_STIMULUS}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(ParametricNAMCapture PRIVATE "${CAPTURE_STIMULUS}")
+else()
+    add_custom_command(TARGET ParametricNAMCapture POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CAPTURE_STIMULUS}"
+                "$<TARGET_FILE_DIR:ParametricNAMCapture>/CaptureStimulus.wav"
+        VERBATIM)
+endif()

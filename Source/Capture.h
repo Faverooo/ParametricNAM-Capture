@@ -3,6 +3,8 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <atomic>
 #include <optional>
+#include <stdexcept>
+#include <span>
 #include <vector>
 
 namespace capture
@@ -24,17 +26,31 @@ struct Analysed
     std::vector<float> input, target;
 };
 
+struct StimulusWindow
+{
+    size_t start = 0;
+    size_t length = 0;
+};
+
+StimulusWindow calibrationWindow(std::span<const float> stimulus);
 std::vector<float> makeStimulus();
 std::vector<float> readWav(const juce::File&);
 void writeWav(const juce::File&, const std::vector<float>&);
-Analysed analyse(const Recording&, int frames, float markerLevel);
-double relativeInputError(const std::vector<float>& reference, const std::vector<float>& actual);
-void requireUsable(const Analysed&);
+struct LoopbackSyncError : std::runtime_error
+{
+    LoopbackSyncError(float loopback, float microphone, float score);
+    float loopPeak, micPeak, correlation;
+};
+
+Analysed analyse(const Recording&, int frames);
+double relativeInputError(std::span<const float> reference, std::span<const float> actual);
+void requireUsable(const Analysed&, bool requireMicrophone = true);
+std::optional<double> microphoneSnrDb(const Recording&, const Analysed&);
 
 class Recorder final : public juce::AudioIODeviceCallback
 {
 public:
-    void start(const std::vector<float>& input, float sendGain, int loopIndex, int micIndex);
+    void start(std::span<const float> input, float sendGain, int loopIndex, int micIndex);
     void cancel();
     bool isBusy() const;
     bool failed() const;

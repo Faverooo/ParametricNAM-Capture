@@ -53,9 +53,12 @@ jobs:
         run: |
           mkdir package
           cp -R "build/ParametricNAMCapture_artefacts/Release/$APP" package/
+          if [[ "$RUNNER_OS" != "macOS" ]]; then
+            cp build/ParametricNAMCapture_artefacts/Release/CaptureStimulus.wav package/
+          fi
           cp README.md package/
           cp ci-juce/LICENSE.md package/LICENSE-JUCE.md
-          (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip "$APP" README.md LICENSE-JUCE.md)
+          (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip *)
       - uses: actions/upload-artifact@v4
         with:
           name: Capture-${{ runner.os }}-${{ runner.arch }}

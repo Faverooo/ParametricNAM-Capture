@@ -24,6 +24,7 @@ struct Point
     juce::String recording;
 };
 
+double parseNumber(const juce::String&);
 std::vector<Control> parseControls(const juce::String&);
 std::vector<Priority> parsePriorities(const juce::String&, const std::vector<Control>&);
 std::vector<Point> plan(const std::vector<Control>&, const std::vector<Priority>&, int trainCount, int testCount);
@@ -35,7 +36,8 @@ public:
                           std::vector<Point>, const std::vector<float>& stimulus, double sendDb);
     static Session open(const juce::File&);
 
-    void calibrate(const Recording&, const Analysed&);
+    void calibrate(const Recording&, const Analysed&, size_t stimulusStart = 0);
+    std::optional<double> checkQuiet(const Recording&, const Analysed&, size_t stimulusStart) const;
     void saveTake(size_t index, const Recording&, const Analysed&);
     void exportDataset(bool normalise = false) const;
     void setSendDb(double);
@@ -48,11 +50,12 @@ public:
     juce::String amplifier;
     std::vector<Control> controls;
     std::vector<Point> points;
-    double sendDb = -18;
+    double sendDb = 0;
 
 private:
     void save() const;
     juce::String writeCapture(const Recording&, const Analysed&) const;
     juce::String calibration;
+    size_t calibrationStart = 0;
 };
 } // namespace capture

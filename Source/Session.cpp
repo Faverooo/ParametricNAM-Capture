@@ -2,7 +2,8 @@
 
 #include <array>
 #include <cmath>
-#include <cstdlib>
+#include <locale>
+#include <sstream>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -36,16 +37,6 @@ void createDirectory(const juce::File& folder)
     const auto result = folder.createDirectory();
     if (result.failed())
         throw std::runtime_error(result.getErrorMessage().toStdString());
-}
-
-double number(const juce::String& text)
-{
-    const auto value = text.trim().toStdString();
-    char* end = nullptr;
-    const double result = std::strtod(value.c_str(), &end);
-    if (value.empty() || *end != '\0' || !std::isfinite(result))
-        throw std::runtime_error("Invalid number: " + value);
-    return result;
 }
 
 juce::StringArray fields(const juce::String& line, const char* separator)
@@ -98,6 +89,20 @@ double halton(int index, int base)
     return value;
 }
 
+double compareAligned(std::span<const float> reference, size_t referenceStart,
+                      std::span<const float> take, size_t takeStart)
+{
+    const auto start = std::max(referenceStart, takeStart);
+    if (start - referenceStart >= reference.size() || start - takeStart >= take.size())
+        throw std::runtime_error("Calibration does not overlap this take. Recalibrate.");
+    const auto length = std::min(reference.size() - (start - referenceStart),
+                                 take.size() - (start - takeStart));
+    if (length < 3 * sampleRate)
+        throw std::runtime_error("Calibration overlap is too short. Recalibrate.");
+    return relativeInputError(reference.subspan(start - referenceStart, length),
+                              take.subspan(start - takeStart, length));
+}
+
 juce::File revision(const juce::File& root, const juce::String& id)
 {
     if (id.isEmpty() || id.containsAnyOf("/\\") || id == "." || id == "..")
@@ -105,6 +110,17 @@ juce::File revision(const juce::File& root, const juce::String& id)
     return root.getChildFile("recordings").getChildFile(id);
 }
 } // namespace
+
+double parseNumber(const juce::String& text)
+{
+    const auto value = text.trim().toStdString();
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    double result = 0;
+    if (!(input >> result) || !input.eof() || !std::isfinite(result))
+        throw std::runtime_error("Invalid number: " + value + ". Use a decimal point (e.g. 0.5).");
+    return result;
+}
 
 std::vector<Control> parseControls(const juce::String& text)
 {
@@ -117,9 +133,9 @@ std::vector<Control> parseControls(const juce::String& text)
         auto columns = fields(line, ",");
         if (columns.size() != 5 && columns.size() != 7)
             throw std::runtime_error("Each control needs ID, label, min, max, step and optionally model min/max.");
-        const double minimum = number(columns[2]), maximum = number(columns[3]), step = number(columns[4]);
-        const double modelMinimum = columns.size() == 7 ? number(columns[5]) : 0;
-        const double modelMaximum = columns.size() == 7 ? number(columns[6]) : 1;
+        const double minimum = parseNumber(columns[2]), maximum = parseNumber(columns[3]), step = parseNumber(columns[4]);
+        const double modelMinimum = columns.size() == 7 ? parseNumber(columns[5]) : 0;
+        const double modelMaximum = columns.size() == 7 ? parseNumber(columns[6]) : 1;
         if (columns[0].isEmpty() || columns[1].isEmpty()
             || !columns[0].containsOnly("abcdefghijklmnopqrstuvwxyz0123456789")
             || !ids.insert(columns[0]).second || minimum >= maximum || !(step > 0)
@@ -146,7 +162,7 @@ std::vector<Priority> parsePriorities(const juce::String& text, const std::vecto
         const auto columns = fields(line, ",");
         if (columns.size() != int(controls.size()) + 1)
             throw std::runtime_error("Each priority needs a count and one value or range per control.");
-        const double count = number(columns[0]);
+        const double count = parseNumber(columns[0]);
         if (count < 1 || count > 2000 || count != std::floor(count))
             throw std::runtime_error("Invalid priority count.");
         Priority priority{static_cast<int>(count), {}};
@@ -162,8 +178,8 @@ std::vector<Priority> parsePriorities(const juce::String& text, const std::vecto
             const auto endpoints = fields(column, ":");
             if (endpoints.size() < 1 || endpoints.size() > 2)
                 throw std::runtime_error("Invalid priority range.");
-            const double low = number(endpoints[0]);
-            const double high = endpoints.size() == 2 ? number(endpoints[1]) : low;
+            const double low = parseNumber(endpoints[0]);
+            const double high = endpoints.size() == 2 ? parseNumber(endpoints[1]) : low;
             if (low < control.minimum || high > control.maximum || low > high)
                 throw std::runtime_error("Priority lies outside " + control.label.toStdString());
             priority.ranges.emplace_back(low, high);
@@ -182,7 +198,7 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
                                          [](int sum, const Priority& priority) { return sum + priority.count; });
     if (reserved > trainCount)
         throw std::runtime_error("The priority takes exceed the training budget.");
-    std::set<std::vector<int>> used;
+    std::set<std::vector<double>> used;
     std::vector<Point> training, testing;
     const std::array<int, 8> bases{2, 3, 5, 7, 11, 13, 17, 19};
 
@@ -191,9 +207,20 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         if (count == 0)
             return;
         std::vector<int> first, width;
+        std::vector<std::optional<double>> exact(controls.size());
         for (size_t i = 0; i < controls.size(); ++i)
         {
             const auto& control = controls[i];
+            if (ranges[i].first == ranges[i].second)
+            {
+                const double value = ranges[i].first;
+                const auto nearest = std::round((value - control.minimum) / control.step);
+                const auto gridValue = std::min(control.maximum, control.minimum + nearest * control.step);
+                exact[i] = std::abs(value - gridValue) <= control.step * 1e-8 ? gridValue : value;
+                first.push_back(0);
+                width.push_back(1);
+                continue;
+            }
             const auto low = int(std::ceil((ranges[i].first - control.minimum) / control.step - 1e-8));
             const auto high = std::min(gridSteps(control),
                 int(std::floor((ranges[i].second - control.minimum) / control.step + 1e-8)));
@@ -204,12 +231,13 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         }
         auto accept = [&](const std::vector<int>& point)
         {
-            if (!used.insert(point).second)
-                return;
             Point entry;
             entry.test = test;
             for (size_t i = 0; i < controls.size(); ++i)
-                entry.dials.push_back(std::min(controls[i].maximum, controls[i].minimum + point[i] * controls[i].step));
+                entry.dials.push_back(exact[i].value_or(
+                    std::min(controls[i].maximum, controls[i].minimum + point[i] * controls[i].step)));
+            if (!used.insert(entry.dials).second)
+                return;
             (test ? testing : training).push_back(std::move(entry));
             --count;
         };
@@ -280,6 +308,10 @@ Session Session::open(const juce::File& folder)
     result.amplifier = doc["amplifier"].toString();
     result.sendDb = double(doc["send_db"]);
     result.calibration = doc["calibration"].toString();
+    const auto start = int(doc["calibration_start_sample"]);
+    if (start < 0 || start > 240 * sampleRate)
+        throw std::runtime_error("Invalid calibration offset.");
+    result.calibrationStart = size_t(start);
     for (const auto& c : *doc["controls"].getArray())
         result.controls.push_back({c["id"].toString(), c["label"].toString(), double(c["min"]), double(c["max"]),
                                    double(c["capture_step"]), double(c["default"]), double(c["model_min"]),
@@ -307,6 +339,7 @@ void Session::save() const
     put(doc, "amplifier", amplifier);
     put(doc, "send_db", sendDb);
     put(doc, "calibration", calibration);
+    put(doc, "calibration_start_sample", int(calibrationStart));
     put(doc, "controls", controlsJson(controls));
     juce::Array<var> rows;
     for (const auto& point : points)
@@ -339,22 +372,36 @@ juce::String Session::writeCapture(const Recording& recording, const Analysed& a
     return id;
 }
 
-void Session::calibrate(const Recording& recording, const Analysed& analysed)
+void Session::calibrate(const Recording& recording, const Analysed& analysed, size_t stimulusStart)
 {
     requireUsable(analysed);
     if (completed() > 0)
     {
         const auto original = readWav(revision(folder, calibration).getChildFile("input.wav"));
-        if (relativeInputError(original, analysed.input) > 0.12)
+        if (compareAligned(original, calibrationStart, analysed.input, stimulusStart) > 0.12)
             throw std::runtime_error("The calibration differs from the original. Restore the interface levels and routing.");
         writeCapture(recording, analysed);
         return;
     }
     const auto id = writeCapture(recording, analysed);
     const auto old = calibration;
+    const auto previousStart = calibrationStart;
     calibration = id;
+    calibrationStart = stimulusStart;
     try { save(); }
-    catch (...) { calibration = old; throw; }
+    catch (...) { calibration = old; calibrationStart = previousStart; throw; }
+}
+
+std::optional<double> Session::checkQuiet(const Recording& recording, const Analysed& analysed,
+                                          size_t stimulusStart) const
+{
+    requireUsable(analysed, false);
+    if (!hasCalibration())
+        throw std::runtime_error("Check the loudest setting first.");
+    const auto reference = readWav(revision(folder, calibration).getChildFile("input.wav"));
+    if (compareAligned(reference, calibrationStart, analysed.input, stimulusStart) > 0.12)
+        throw std::runtime_error("Loopback changed since the loud check. Keep the send and interface gains fixed.");
+    return microphoneSnrDb(recording, analysed);
 }
 
 void Session::setSendDb(double db)
@@ -375,8 +422,16 @@ void Session::saveTake(size_t index, const Recording& recording, const Analysed&
     if (!hasCalibration())
         throw std::runtime_error("Run calibration before recording a take.");
     const auto reference = readWav(revision(folder, calibration).getChildFile("input.wav"));
-    if (relativeInputError(reference, analysed.input) > 0.12)
+    if (compareAligned(reference, calibrationStart, analysed.input, 0) > 0.12)
         throw std::runtime_error("The loopback differs from calibration. Check routing and interface levels.");
+    const auto firstRecorded = std::find_if(points.begin(), points.end(),
+        [](const Point& point) { return point.recording.isNotEmpty(); });
+    if (firstRecorded != points.end())
+    {
+        const auto previous = readWav(revision(folder, firstRecorded->recording).getChildFile("input.wav"));
+        if (relativeInputError(previous, analysed.input) > 0.12)
+            throw std::runtime_error("The full loopback differs from earlier takes. Check routing and interface levels.");
+    }
     auto& current = points.at(index).recording;
     const auto old = current;
     current = writeCapture(recording, analysed);
@@ -420,7 +475,10 @@ void Session::exportDataset(bool normalise) const
     const auto exportId = juce::Uuid().toString();
     const auto audioFolder = destination.getChildFile(exportId);
     createDirectory(audioFolder);
-    writeWav(audioFolder.getChildFile("reference.wav"), input);
+    const auto fullReference = revision(folder, points.front().recording).getChildFile("input.wav");
+    const auto fullInput = readWav(fullReference);
+    if (!fullReference.copyFileTo(audioFolder.getChildFile("reference.wav")))
+        throw std::runtime_error("Cannot export the full-length reference WAV.");
     put(document, "x", exportId + "/reference.wav");
     float scale = 1.0f;
     if (normalise)
@@ -441,8 +499,10 @@ void Session::exportDataset(bool normalise) const
     {
         const auto& point = points[index];
         const auto recording = revision(folder, point.recording);
+        const auto takeInput = readWav(recording.getChildFile("input.wav"));
         if (!recording.getChildFile("target.wav").existsAsFile()
-            || relativeInputError(input, readWav(recording.getChildFile("input.wav"))) > 0.12)
+            || compareAligned(input, calibrationStart, takeInput, 0) > 0.12
+            || relativeInputError(fullInput, takeInput) > 0.12)
             throw std::runtime_error("Take " + std::to_string(index + 1) + " no longer matches calibration. Record it again.");
         auto entry = object();
         put(entry, "id", juce::String(int(index + 1)));
