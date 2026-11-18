@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Session.h"
+#include "UpdateCheck.h"
 #include <iostream>
 #include <array>
 #include <clocale>
@@ -15,6 +16,11 @@ inline void smokeTest(const juce::File& folder)
         if (!condition)
             throw std::runtime_error(message);
     };
+
+    const auto older = UpdateCheck::parseVersion("0.2.9");
+    const auto newer = UpdateCheck::parseVersion("v0.10.0");
+    check(older && newer && *newer > *older && !UpdateCheck::parseVersion("v1.2.3-beta")
+          && !UpdateCheck::parseVersion("v1.2"), "Release version comparison failed.");
 
     auto controls = parseControls("gain, Gain, 2, 10, 0.5, 0.2, 1\nbass, Bass, 0, 10, 1");
     auto points = plan(controls, parsePriorities("1, 9.7, *", controls), 2, 1);

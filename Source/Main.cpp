@@ -1,4 +1,5 @@
 #include "Session.h"
+#include "UpdateCheck.h"
 #include "PlanGrid.h"
 #include "Smoke.h"
 
@@ -52,6 +53,10 @@ public:
         audioViewport.setViewedComponent(&audioSelector, false);
         planViewport.setScrollBarsShown(true, false);
         audioViewport.setScrollBarsShown(true, false);
+        addChildComponent(updateButton);
+        updateButton.setColour(juce::TextButton::textColourOffId, juce::Colour(accent));
+        updateButton.setTooltip("Open the latest Capture release on GitHub");
+        updateButton.onClick = [this] { updates.openReleasePage(); };
         for (auto* component : planFields())
             planContent.addAndMakeVisible(component);
         for (auto* component : std::initializer_list<juce::Component*>{
@@ -219,6 +224,11 @@ public:
         auto area = getLocalBounds().reduced(24);
         auto header = area.removeFromTop(44);
         wiringButton.setBounds(header.removeFromRight(112).withHeight(34));
+        if (updateButton.isVisible())
+        {
+            header.removeFromRight(8);
+            updateButton.setBounds(header.removeFromRight(124).withHeight(34));
+        }
         title.setBounds(header);
         subtitle.setBounds(area.removeFromTop(27));
         auto gap = area.removeFromTop(14);
@@ -690,6 +700,16 @@ private:
 
     void timerCallback() override
     {
+        if (!updateButton.isVisible())
+        {
+            const auto version = updates.availableVersion();
+            if (version.isNotEmpty())
+            {
+                updateButton.setButtonText("Update " + version);
+                updateButton.setVisible(true);
+                resized();
+            }
+        }
         if (step == Step::audio)
             refreshAudioChannels();
         if (!pending)
@@ -840,6 +860,7 @@ private:
     }
 
     CaptureTheme theme;
+    UpdateCheck updates{"Faverooo/ParametricNAM-Capture", PNAM_BUILD_VERSION};
     capture::Recorder recorder;
     juce::AudioDeviceManager devices;
     juce::AudioDeviceSelectorComponent audioSelector;
@@ -856,7 +877,7 @@ private:
     juce::ComboBox loopInput, ampOutput;
     juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"}, wiringButton{"Wiring guide"},
                      stimulusButton{"Import stimulus"}, openButton{"Open session"},
-                     nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"};
+                     nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"}, updateButton;
     juce::ToggleButton normalise{"Normalise to -3 dBFS"};
     juce::ListBox list;
     std::vector<float> stimulus, sessionStimulus;
@@ -890,7 +911,7 @@ class CaptureApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "ParametricNAM Capture"; }
-    const juce::String getApplicationVersion() override { return "0.1.0"; }
+    const juce::String getApplicationVersion() override { return PNAM_BUILD_VERSION; }
     void initialise(const juce::String& arguments) override
     {
         const auto args = juce::StringArray::fromTokens(arguments, true);

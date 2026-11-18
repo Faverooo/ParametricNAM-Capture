@@ -26,3 +26,7 @@ On Linux the executable is `build/ParametricNAMCapture_artefacts/Release/Paramet
 ## GitHub Actions
 
 Each successful build uploads an archive for its operating system and architecture. Pushing a `v*` tag publishes the same archives as GitHub Release assets once all platforms pass. The archives include the standalone application, the standard stimulus, and this guide. On Linux and Windows, keep `CaptureStimulus.wav` alongside the executable. On macOS, the WAV is inside the app bundle. Release binaries are unsigned.
+
+## Updates
+
+The interface checks GitHub for the latest stable release in the background. If that release is newer, the **Update** button opens its download page. The check needs internet access. Installation remains manual.
