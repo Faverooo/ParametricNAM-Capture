@@ -24,9 +24,9 @@ jobs:
             app: ParametricNAM Capture.app
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check out JUCE 8.0.6
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: juce-framework/JUCE
           ref: 8.0.6
@@ -59,7 +59,7 @@ jobs:
           cp README.md package/
           cp ci-juce/LICENSE.md package/LICENSE-JUCE.md
           (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip *)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Capture-${{ runner.os }}-${{ runner.arch }}
           path: ParametricNAM-Capture-*.zip
@@ -72,7 +72,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: Capture-*
           path: packages
