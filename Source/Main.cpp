@@ -63,7 +63,7 @@ public:
                  &title, &subtitle, &wiringButton, &openButton, &planViewport, &audioViewport,
                  &welcomeLead, &microphoneHelp, &loopbackHelp, &sendHelp,
                  &sessionTitle, &routingLabel, &loopInput, &ampOutputLabel, &ampOutput, &deviceSummary, &sendLabel, &sendLevel,
-                 &selectedTake, &list, &nextButton, &backButton, &cancelButton, &normalise, &statusLabel, &progressBar})
+                 &selectedTake, &list, &nextButton, &backButton, &cancelButton, &retryLoudButton, &retryQuietButton, &normalise, &statusLabel, &progressBar})
             addAndMakeVisible(component);
 
         title.setText("ParametricNAM Capture", juce::dontSendNotification);
@@ -179,6 +179,8 @@ public:
         nextButton.onClick = [this] { advance(); };
         backButton.onClick = [this] { goBack(); };
         cancelButton.onClick = [this] { cancel(); };
+        retryLoudButton.onClick = [this] { recheckLevels(LevelCheck::loud); };
+        retryQuietButton.onClick = [this] { recheckLevels(LevelCheck::quiet); };
 
         showStep(Step::welcome);
         setSize(960, 700);
@@ -261,6 +263,14 @@ public:
         backButton.setBounds(actions.removeFromLeft(84));
         actions.removeFromLeft(10);
         openButton.setBounds(actions.removeFromLeft(128));
+        if (step == Step::calibration)
+        {
+            actions = {backButton.getRight() + 10, backButton.getY(),
+                       cancelButton.getX() - backButton.getRight() - 20, backButton.getHeight()};
+            retryLoudButton.setBounds(actions.removeFromLeft(124));
+            actions.removeFromLeft(8);
+            retryQuietButton.setBounds(actions.removeFromLeft(124));
+        }
         area.removeFromBottom(10);
         statusLabel.setBounds(area.removeFromBottom(32));
         area.removeFromBottom(6);
@@ -751,6 +761,14 @@ private:
         sendLevel.setText(juce::String(session->sendDb, 1), false);
     }
 
+    void recheckLevels(LevelCheck check)
+    {
+        if (step != Step::calibration || pending)
+            return;
+        levelCheck = check;
+        start(true);
+    }
+
     void start(bool calibration)
     {
         run([&]
@@ -858,20 +876,22 @@ private:
                     session->calibrate(*recording, analysed, calibrationExcerpt.start);
                     levelCheck = LevelCheck::quiet;
                     const auto micDb = juce::Decibels::gainToDecibels(analysed.micPeak);
-                    status("Loud check: mic peak " + juce::String(micDb, 1)
-                           + " dBFS. Now set the amp to its quietest setting.", micDb > -3.0f);
+                    if (micDb > -3.0f)
+                        status("The mic is close to clipping. Lower the mic gain and recheck the loud setting.", true);
+                    else
+                        status("The loud setting has headroom. Now check the quietest setting.");
                 }
                 else if (captureIndex < 0)
                 {
                     const auto snr = session->checkQuiet(*recording, analysed, calibrationExcerpt.start);
                     levelCheck = LevelCheck::complete;
                     if (!snr)
-                        status("Quiet check finished. Could not estimate the mic noise floor.", true);
+                        status("Could not measure the background noise. Let the room and amp settle, then recheck quiet.", true);
                     else if (*snr < 20.0)
-                        status("Quiet check: estimated SNR " + juce::String(*snr, 1)
-                               + " dB. The quiet setting may be close to the noise floor.", true);
+                        status("The quiet setting is hard to hear above the background noise. "
+                               "Reduce nearby noise and recheck quiet. If you move the mic or change its gain, recheck loud first.", true);
                     else
-                        status("Quiet check passed. Estimated mic SNR: " + juce::String(*snr, 1) + " dB.");
+                        status("The quiet setting is clearly above the background noise.");
                 }
                 else
                 {
@@ -933,6 +953,9 @@ private:
         sendLevel.setEnabled(ready && !pending && session->completed() == 0);
         backButton.setEnabled(!pending);
         cancelButton.setVisible(pending);
+        const bool canRecheck = step == Step::calibration && !pending;
+        retryLoudButton.setVisible(canRecheck && levelCheck != LevelCheck::loud);
+        retryQuietButton.setVisible(canRecheck && levelCheck == LevelCheck::complete);
         progressBar.setVisible(pending);
         const int row = list.getSelectedRow();
         const bool validRow = ready && row >= 0 && row < int(session->points.size());
@@ -998,7 +1021,8 @@ private:
     juce::ComboBox loopInput, ampOutput;
     juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"}, wiringButton{"Wiring guide"},
                      stimulusButton{"Import stimulus"}, openButton{"Open session"},
-                     nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"}, updateButton;
+                     nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"},
+                     retryLoudButton{"Recheck loud"}, retryQuietButton{"Recheck quiet"}, updateButton;
     juce::ToggleButton normalise{"Normalise to -3 dBFS"};
     juce::ListBox list;
     std::vector<float> stimulus, sessionStimulus;
