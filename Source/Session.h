@@ -27,7 +27,7 @@ struct Point
 double parseNumber(const juce::String&);
 std::vector<Control> parseControls(const juce::String&);
 std::vector<Priority> parsePriorities(const juce::String&, const std::vector<Control>&);
-std::vector<Point> plan(const std::vector<Control>&, const std::vector<Priority>&, int trainCount, int testCount);
+std::vector<Point> plan(const std::vector<Control>&, const std::vector<Priority>&, int takeCount);
 
 class Session
 {
@@ -38,7 +38,7 @@ public:
 
     void calibrate(const Recording&, const Analysed&, size_t stimulusStart = 0);
     std::optional<double> checkQuiet(const Recording&, const Analysed&, size_t stimulusStart) const;
-    void saveTake(size_t index, const Recording&, const Analysed&);
+    void saveTake(size_t index, const Recording&, const Analysed&, bool acceptQuietMic = false);
     void exportDataset(bool normalise = false) const;
     void setSendDb(double);
     bool hasCalibration() const { return !calibration.isEmpty(); }

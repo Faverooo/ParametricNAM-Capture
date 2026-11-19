@@ -58,7 +58,7 @@ jobs:
           if [[ "$RUNNER_OS" != "macOS" ]]; then
             cp build/ParametricNAMCapture_artefacts/Release/CaptureStimulus.wav package/
           fi
-          cp README.md package/
+          cp README.md LICENSE package/
           cp ci-juce/LICENSE.md package/LICENSE-JUCE.md
           (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip *)
       - uses: actions/upload-artifact@v6

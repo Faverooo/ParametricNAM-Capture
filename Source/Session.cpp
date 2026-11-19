@@ -190,19 +190,19 @@ std::vector<Priority> parsePriorities(const juce::String& text, const std::vecto
 }
 
 std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<Priority>& priorities,
-                        int trainCount, int testCount)
+                        int takeCount)
 {
-    if (trainCount < 1 || testCount < 1 || trainCount > 2000 || testCount > 2000)
-        throw std::runtime_error("Choose between 1 and 2000 takes in each split.");
+    if (takeCount < 1 || takeCount > 2000)
+        throw std::runtime_error("Choose between 1 and 2000 takes.");
     const int reserved = std::accumulate(priorities.begin(), priorities.end(), 0,
                                          [](int sum, const Priority& priority) { return sum + priority.count; });
-    if (reserved > trainCount)
-        throw std::runtime_error("The priority takes exceed the training budget.");
+    if (reserved > takeCount)
+        throw std::runtime_error("The priority takes exceed the take budget.");
     std::set<std::vector<double>> used;
-    std::vector<Point> training, testing;
+    std::vector<Point> points;
     const std::array<int, 8> bases{2, 3, 5, 7, 11, 13, 17, 19};
 
-    auto add = [&](int count, const std::vector<std::pair<double, double>>& ranges, bool test)
+    auto add = [&](int count, const std::vector<std::pair<double, double>>& ranges)
     {
         if (count == 0)
             return;
@@ -215,7 +215,7 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
             {
                 const double value = ranges[i].first;
                 const auto nearest = std::round((value - control.minimum) / control.step);
-                const auto gridValue = std::min(control.maximum, control.minimum + nearest * control.step);
+                const auto gridValue = nearest == gridSteps(control) ? control.maximum : control.minimum + nearest * control.step;
                 exact[i] = std::abs(value - gridValue) <= control.step * 1e-8 ? gridValue : value;
                 first.push_back(0);
                 width.push_back(1);
@@ -232,17 +232,19 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         auto accept = [&](const std::vector<int>& point)
         {
             Point entry;
-            entry.test = test;
             for (size_t i = 0; i < controls.size(); ++i)
-                entry.dials.push_back(exact[i].value_or(
-                    std::min(controls[i].maximum, controls[i].minimum + point[i] * controls[i].step)));
+            {
+                const auto& control = controls[i];
+                const auto value = point[i] == gridSteps(control) ? control.maximum : control.minimum + point[i] * control.step;
+                entry.dials.push_back(exact[i].value_or(value));
+            }
             if (!used.insert(entry.dials).second)
                 return;
-            (test ? testing : training).push_back(std::move(entry));
+            points.push_back(std::move(entry));
             --count;
         };
 
-        for (int index = test ? 4001 : 1, attempts = 0; count > 0 && attempts < 50000; ++index, ++attempts)
+        for (int index = 1, attempts = 0; count > 0 && attempts < 50000; ++index, ++attempts)
         {
             auto point = first;
             for (size_t i = 0; i < point.size(); ++i)
@@ -268,14 +270,46 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
     };
 
     for (const auto& priority : priorities)
-        add(priority.count, priority.ranges, false);
+        add(priority.count, priority.ranges);
+
     std::vector<std::pair<double, double>> full;
+    std::vector<double> low, high, centre;
     for (const auto& control : controls)
+    {
         full.emplace_back(control.minimum, control.maximum);
-    add(testCount, full, true);
-    add(trainCount - reserved, full, false);
-    training.insert(training.end(), testing.begin(), testing.end());
-    return training;
+        low.push_back(control.minimum);
+        high.push_back(control.maximum);
+        centre.push_back(std::min(control.maximum, control.minimum + (gridSteps(control) / 2) * control.step));
+    }
+
+    const auto offer = [&](const std::vector<double>& dials)
+    {
+        if (static_cast<int>(points.size()) < takeCount && used.insert(dials).second)
+            points.push_back(Point{dials, false, {}});
+    };
+
+    offer(high);
+    offer(low);
+    for (size_t axis = 0; axis < controls.size(); ++axis)
+    {
+        const auto& control = controls[axis];
+        auto dials = centre;
+        dials[axis] = control.maximum;
+        offer(dials);
+        dials[axis] = control.minimum;
+        offer(dials);
+    }
+    for (size_t axis = 0; axis < controls.size(); ++axis)
+    {
+        const auto& control = controls[axis];
+        if (gridSteps(control) < 2)
+            continue;
+        auto dials = centre;
+        dials[axis] = control.minimum + (gridSteps(control) - 1) * control.step;
+        offer(dials);
+    }
+    add(takeCount - static_cast<int>(points.size()), full);
+    return points;
 }
 
 Session Session::create(const juce::File& folder, juce::String name, std::vector<Control> controls,
@@ -416,9 +450,9 @@ void Session::setSendDb(double db)
     catch (...) { calibration = old; sendDb = previousDb; throw; }
 }
 
-void Session::saveTake(size_t index, const Recording& recording, const Analysed& analysed)
+void Session::saveTake(size_t index, const Recording& recording, const Analysed& analysed, bool acceptQuietMic)
 {
-    requireUsable(analysed);
+    requireUsable(analysed, !acceptQuietMic);
     if (!hasCalibration())
         throw std::runtime_error("Run calibration before recording a take.");
     const auto reference = readWav(revision(folder, calibration).getChildFile("input.wav"));
@@ -449,7 +483,7 @@ int Session::completed() const
 juce::String Session::pointLabel(size_t index) const
 {
     const auto& point = points.at(index);
-    auto text = juce::String(int(index + 1)) + (point.test ? "  Test    " : "  Train  ");
+    auto text = juce::String(int(index + 1)) + (point.test ? "  Test    " : "   ");
     for (size_t i = 0; i < controls.size(); ++i)
         text += controls[i].label + " " + juce::String(point.dials[i], 3).trimCharactersAtEnd("0").trimCharactersAtEnd(".") + "   ";
     return text;

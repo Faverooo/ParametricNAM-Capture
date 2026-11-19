@@ -177,11 +177,13 @@ double relativeInputError(std::span<const float> reference, std::span<const floa
     return signal > 0 ? std::sqrt(error / signal) : 1.0;
 }
 
+bool hasQuietMicrophone(const Analysed& take) { return peak(take.target) < 0.001f; }
+
 void requireUsable(const Analysed& take, bool requireMicrophone)
 {
     if (take.loopPeak >= 0.995f || take.micPeak >= 0.995f)
         throw std::runtime_error("Clipping detected. Lower interface gain and recalibrate.");
-    if (peak(take.input) < 0.003f || (requireMicrophone && peak(take.target) < 0.001f))
+    if (peak(take.input) < 0.003f || (requireMicrophone && hasQuietMicrophone(take)))
         throw std::runtime_error("Input or microphone signal is too quiet. Check routing and levels.");
 }
 
@@ -209,6 +211,7 @@ void Recorder::start(std::span<const float> input, float sendGain, int loopIndex
 {
     if (state.load() == State::recording)
         throw std::runtime_error("A recording is already running.");
+    const auto openingRevision = deviceRevision();
     const auto outputs = outputCount.load();
     if (rate.load() != sampleRate || outputs < 1 || outputs > 2 || inputCount.load() != 2
         || loopIndex < 0 || micIndex < 0 || loopIndex > 1 || micIndex > 1 || loopIndex == micIndex)
@@ -230,11 +233,16 @@ void Recorder::start(std::span<const float> input, float sendGain, int loopIndex
     micPeak.store(0);
     length.store(static_cast<int>(playback.size()));
     state.store(State::recording);
+    if (deviceRevision() != openingRevision)
+    {
+        auto expected = State::recording;
+        state.compare_exchange_strong(expected, State::failed);
+    }
 }
 
 void Recorder::cancel()
 {
-    // The owner removes the callback before cancellation or changing buffers.
+    // The owner holds the device manager callback lock during cancellation.
     state.store(State::idle);
 }
 
@@ -265,11 +273,13 @@ void Recorder::audioDeviceAboutToStart(juce::AudioIODevice* device)
     rate.store(device->getCurrentSampleRate());
     inputCount.store(device->getActiveInputChannels().countNumberOfSetBits());
     outputCount.store(device->getActiveOutputChannels().countNumberOfSetBits());
+    ++revision;
 }
 
 void Recorder::audioDeviceStopped()
 {
     rate.store(0);
+    ++revision;
     auto expected = State::recording;
     state.compare_exchange_strong(expected, State::failed);
 }
@@ -322,6 +332,9 @@ void Recorder::audioDeviceIOCallbackWithContext(const float* const* inputs, int 
     micPeak.store(targetPeak, std::memory_order_relaxed);
     cursor.store(from + count);
     if (from + count == length.load())
-        state.store(State::complete);
+    {
+        auto expected = State::recording;
+        state.compare_exchange_strong(expected, State::complete);
+    }
 }
 } // namespace capture

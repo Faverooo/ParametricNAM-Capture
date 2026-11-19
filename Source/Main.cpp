@@ -95,7 +95,7 @@ public:
         nextButton.setColour(juce::TextButton::buttonColourId, juce::Colour(accent));
         nextButton.setColour(juce::TextButton::textColourOffId, juce::Colour(background));
         deviceSummary.setColour(juce::Label::textColourId, muted);
-        countsLabel.setText("Training takes                Test takes", juce::dontSendNotification);
+        countsLabel.setText("Total takes", juce::dontSendNotification);
         routingLabel.setText("Loopback input", juce::dontSendNotification);
         ampOutputLabel.setText("Amp output", juce::dontSendNotification);
         deviceSummary.setMinimumHorizontalScale(0.92f);
@@ -133,12 +133,9 @@ public:
                              "0", "10", "0.5", "0", "1"});
         };
         addPriority.onClick = [this] { priorities.addRow({"1"}); };
-        trainCount.setInputRestrictions(4, "0123456789");
-        trainCount.setText("30");
-        testCount.setInputRestrictions(4, "0123456789");
-        testCount.setText("10");
-        trainCount.onTextChange = testCount.onTextChange = [this] { updateBudget(); };
-        updateBudget();
+        takeCount.setInputRestrictions(4, "0123456789");
+        takeCount.onTextChange = [this] { customTakeCount = true; updateBudget(); };
+        updateSuggestedCount();
         sendLevel.setInputRestrictions(6, "-0123456789.");
         sendLevel.setText("0");
         sendLevel.onReturnKey = sendLevel.onFocusLost = [this] { run([this] { applySend(); }); };
@@ -163,7 +160,8 @@ public:
         list.setRowHeight(34);
         list.setColour(juce::ListBox::backgroundColourId, juce::Colour(0xff202834));
         list.setMultipleSelectionEnabled(false);
-        progressBar.setPercentageDisplay(true);
+        progressBar.setPercentageDisplay(false);
+        progressBar.setTitle("Recording progress");
 
         wiringButton.onClick = []
         {
@@ -263,9 +261,10 @@ public:
         backButton.setBounds(actions.removeFromLeft(84));
         actions.removeFromLeft(10);
         openButton.setBounds(actions.removeFromLeft(128));
-        auto feedback = area.removeFromBottom(43);
-        progressBar.setBounds(feedback.removeFromBottom(11));
-        statusLabel.setBounds(feedback);
+        area.removeFromBottom(10);
+        statusLabel.setBounds(area.removeFromBottom(32));
+        area.removeFromBottom(6);
+        progressBar.setBounds(area.removeFromBottom(7).reduced(2, 0));
         area.removeFromBottom(8);
 
         auto welcome = area.withTrimmedTop(6);
@@ -353,10 +352,10 @@ private:
     }
     enum class LevelCheck { loud, quiet, complete };
 
-    std::array<juce::Component*, 15> planFields()
+    std::array<juce::Component*, 14> planFields()
     {
         return {&nameLabel, &name, &controlsLabel, &controls, &stepHint, &addControl,
-                &prioritiesLabel, &priorities, &addPriority, &countsLabel, &trainCount, &testCount,
+                &prioritiesLabel, &priorities, &addPriority, &countsLabel, &takeCount,
                 &budgetSummary, &stimulusButton, &stimulusName};
     }
 
@@ -381,8 +380,7 @@ private:
         area.removeFromTop(8);
         countsLabel.setBounds(area.removeFromTop(22));
         auto counts = area.removeFromTop(30);
-        trainCount.setBounds(counts.removeFromLeft(134).withTrimmedRight(14));
-        testCount.setBounds(counts.removeFromLeft(118));
+        takeCount.setBounds(counts.removeFromLeft(134).withTrimmedRight(14));
         budgetSummary.setBounds(counts.withTrimmedLeft(12));
         area.removeFromTop(8);
         auto stimulusRow = area.removeFromTop(32);
@@ -581,8 +579,15 @@ private:
         {
             case Step::welcome: showStep(Step::audio); break;
             case Step::audio:
-                if (audioReady() && forceSampleRate() && audioReady())
-                    showStep(session ? (allRecorded() ? Step::exportData : Step::calibration) : Step::plan);
+                if (audioReady() && forceSampleRate())
+                {
+                    refreshAudioChannels();
+                    if (audioReady())
+                    {
+                        confirmedDeviceRevision = recorder.deviceRevision();
+                        showStep(session ? (allRecorded() ? Step::exportData : Step::calibration) : Step::plan);
+                    }
+                }
                 break;
             case Step::plan: createSession(); break;
             case Step::calibration:
@@ -646,6 +651,15 @@ private:
         priorities.setHeadings(headings);
         addControl.setEnabled(controls.size() < 8);
         addPriority.setEnabled(controls.size() > 0);
+        updateSuggestedCount();
+    }
+
+    void updateSuggestedCount()
+    {
+        constexpr std::array<int, 8> suggested{6, 16, 24, 40, 56, 72, 88, 104};
+        if (!customTakeCount)
+            takeCount.setText(juce::String(suggested[size_t(juce::jlimit(1, 8, controls.size()) - 1)]), false);
+        updateBudget();
     }
 
     void updateBudget()
@@ -653,11 +667,9 @@ private:
         int reserved = 0;
         for (int row = 0; row < priorities.size(); ++row)
             reserved += juce::jlimit(0, 2000, priorities.value(row, 0).getIntValue());
-        const int total = trainCount.getText().getIntValue();
-        const int tests = testCount.getText().getIntValue();
-        budgetSummary.setText(reserved > total ? "Priority takes exceed the training total"
-            : juce::String(reserved) + " priority + " + juce::String(total - reserved) + " automatic + "
-                                      + juce::String(tests) + " test", juce::dontSendNotification);
+        const int total = takeCount.getText().getIntValue();
+        budgetSummary.setText(reserved > total ? "Priority takes exceed the total"
+            : juce::String(reserved) + " priority + " + juce::String(total - reserved) + " automatic", juce::dontSendNotification);
     }
 
     void choose(const juce::String& titleText, const juce::String& pattern, int flags,
@@ -691,7 +703,7 @@ private:
                 throw std::runtime_error("Import a mono 48 kHz WAV before continuing.");
             auto settings = capture::parseControls(controls.text());
             auto prioritiesParsed = capture::parsePriorities(priorities.text("*"), settings);
-            auto points = capture::plan(settings, prioritiesParsed, trainCount.getText().getIntValue(), testCount.getText().getIntValue());
+            auto points = capture::plan(settings, prioritiesParsed, takeCount.getText().getIntValue());
             choose("Choose a new folder name for the capture session", "",
                    juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
                    [settings = std::move(settings), points = std::move(points)](CaptureView& view, const juce::File& file)
@@ -745,7 +757,8 @@ private:
         {
             if (!session || pending || !callbackInstalled)
                 throw std::runtime_error("Open a session and configure the audio device first.");
-            if (!audioReady() || devices.getCurrentAudioDevice()->getCurrentSampleRate() != capture::sampleRate)
+            if (!audioReady() || recorder.deviceRevision() != confirmedDeviceRevision
+                || devices.getCurrentAudioDevice()->getCurrentSampleRate() != capture::sampleRate)
             {
                 levelCheck = LevelCheck::loud;
                 showStep(Step::audio);
@@ -771,9 +784,10 @@ private:
     {
         if (!pending)
             return;
-        devices.removeAudioCallback(&recorder);
-        recorder.cancel();
-        devices.addAudioCallback(&recorder);
+        {
+            const juce::ScopedLock lock(devices.getAudioCallbackLock());
+            recorder.cancel();
+        }
         pending = false;
         progress = 0;
         status("Recording cancelled.");
@@ -861,14 +875,38 @@ private:
                 }
                 else
                 {
-                    session->saveTake(size_t(captureIndex), *recording, analysed);
-                    selectNext();
-                    if (allRecorded())
-                        showStep(Step::exportData);
-                    status("Take saved   |   Loop delay " + juce::String(analysed.delay) + " samples");
+                    const auto index = size_t(captureIndex);
+                    if (capture::hasQuietMicrophone(analysed))
+                        confirmQuietTake(index, std::move(*recording), std::move(analysed));
+                    else
+                        saveRecording(index, *recording, analysed, false);
                 }
             });
         }
+    }
+
+    void confirmQuietTake(size_t index, capture::Recording recording, capture::Analysed analysed)
+    {
+        auto take = std::make_shared<std::pair<capture::Recording, capture::Analysed>>(
+            std::move(recording), std::move(analysed));
+        juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::WarningIcon, "Very quiet microphone",
+            "This take peaks below -60 dBFS. If this control setting intentionally mutes the amp, keep the take. "
+            "Otherwise check the mic and record it again.",
+            "Keep take", "Record again", this,
+            juce::ModalCallbackFunction::create([safe = juce::Component::SafePointer<CaptureView>(this), index, take](int keep)
+            {
+                if (safe != nullptr && keep != 0)
+                    safe->run([&] { safe->saveRecording(index, take->first, take->second, true); });
+            }));
+    }
+
+    void saveRecording(size_t index, const capture::Recording& recording, const capture::Analysed& analysed, bool quiet)
+    {
+        session->saveTake(index, recording, analysed, quiet);
+        selectNext();
+        if (allRecorded())
+            showStep(Step::exportData);
+        status("Take saved   |   Loop delay " + juce::String(analysed.delay) + " samples");
     }
 
     void selectNext()
@@ -955,7 +993,7 @@ private:
     std::unique_ptr<juce::FileChooser> chooser;
     juce::Label title, subtitle, welcomeLead, microphoneHelp, loopbackHelp, sendHelp, nameLabel, controlsLabel, prioritiesLabel, countsLabel,
                 stimulusName, sessionTitle, routingLabel, ampOutputLabel, sendLabel, statusLabel, selectedTake, stepHint, budgetSummary, deviceSummary;
-    juce::TextEditor name, trainCount, testCount, sendLevel;
+    juce::TextEditor name, takeCount, sendLevel;
     PlanGrid controls, priorities;
     juce::ComboBox loopInput, ampOutput;
     juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"}, wiringButton{"Wiring guide"},
@@ -969,10 +1007,12 @@ private:
     float loopMeter = 0.0f, micMeter = 0.0f;
     double progress = 0;
     juce::ProgressBar progressBar;
+    bool customTakeCount = false;
     bool requestingAudio = false;
     bool callbackInstalled = false, pending = false;
     LevelCheck levelCheck = LevelCheck::loud;
     int captureIndex = -1;
+    unsigned confirmedDeviceRevision = 0;
 };
 
 class CaptureWindow final : public juce::DocumentWindow

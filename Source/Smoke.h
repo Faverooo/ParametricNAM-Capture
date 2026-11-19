@@ -23,10 +23,15 @@ inline void smokeTest(const juce::File& folder)
           && !UpdateCheck::parseVersion("v1.2"), "Release version comparison failed.");
 
     auto controls = parseControls("gain, Gain, 2, 10, 0.5, 0.2, 1\nbass, Bass, 0, 10, 1");
-    auto points = plan(controls, parsePriorities("1, 9.7, *", controls), 2, 1);
+    auto points = plan(controls, parsePriorities("1, 9.7, *", controls), 3);
     check(points.size() == 3 && points[0].dials[0] == 9.7
-            && !points[1].test && points[2].test && points[2].dials != points[0].dials
-            && points[2].dials != points[1].dials, "Invalid priority or held-out split.");
+          && points[1].dials == std::vector<double>{10, 10}
+          && points[2].dials == std::vector<double>{2, 0}
+          && std::none_of(points.begin(), points.end(), [](const auto& point) { return point.test; }),
+          "Invalid priority or missing endpoints.");
+    const auto oneDial = plan(parseControls("gain, Gain, 0, 10, 0.1"), {}, 6);
+    check(oneDial.size() == 6 && oneDial[0].dials[0] == 10.0 && oneDial[1].dials[0] == 0.0
+          && oneDial[2].dials[0] > 9.0, "One-control plan skipped the high end.");
 
     const auto signal = makeStimulus();
     const int n = sampleRate * 8;
@@ -113,6 +118,13 @@ inline void smokeTest(const juce::File& folder)
         auto [recording, analysed] = simulate(0.6f + 0.2f * float(i));
         session.saveTake(i, recording, analysed);
     }
+    auto [quietRaw, quietAligned] = simulate(0.0f);
+    bool quietRejected = false;
+    try { session.saveTake(0, quietRaw, quietAligned); }
+    catch (const std::runtime_error&) { quietRejected = true; }
+    check(quietRejected && hasQuietMicrophone(quietAligned), "A quiet take must require confirmation.");
+    session.saveTake(0, quietRaw, quietAligned, true);
+
     const auto oldRecording = session.points[0].recording;
     auto [retake, analysed] = simulate(0.5f);
     session.saveTake(0, retake, analysed);

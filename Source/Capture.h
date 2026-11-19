@@ -44,6 +44,7 @@ struct LoopbackSyncError : std::runtime_error
 
 Analysed analyse(const Recording&, int frames);
 double relativeInputError(std::span<const float> reference, std::span<const float> actual);
+bool hasQuietMicrophone(const Analysed&);
 void requireUsable(const Analysed&, bool requireMicrophone = true);
 std::optional<double> microphoneSnrDb(const Recording&, const Analysed&);
 
@@ -54,6 +55,7 @@ public:
     void cancel();
     bool isBusy() const;
     bool failed() const;
+    unsigned deviceRevision() const { return revision.load(); }
     double progress() const;
     std::pair<float, float> currentPeaks() const;
     std::optional<Recording> take();
@@ -68,6 +70,7 @@ private:
     std::atomic<State> state{State::idle};
     std::atomic<int> cursor{0}, length{0};
     std::atomic<double> rate{0};
+    std::atomic<unsigned> revision{0};
     std::atomic<float> loopPeak{0}, micPeak{0};
     std::atomic<int> inputCount{0}, outputCount{0};
     Recording result;
