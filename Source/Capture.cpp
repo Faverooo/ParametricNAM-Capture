@@ -18,6 +18,54 @@ std::vector<float> marker()
     return signal;
 }
 
+constexpr int micMarkerFrames = 2047;
+constexpr int markerGap = sampleRate / 8;
+constexpr int micAlignmentGuard = 96;
+constexpr int maxMarkerDrift = 4;
+constexpr int maxMicDelay = tailFrames - markerGap - micMarkerFrames - 480;
+
+std::vector<float> micMarker()
+{
+    std::mt19937 random(6871);
+    std::vector<float> signal(micMarkerFrames);
+    float low = 0, slow = 0;
+    for (auto& sample : signal)
+    {
+        low += 0.23f * (((random() & 1u) != 0 ? 1.0f : -1.0f) - low);
+        slow += 0.025f * (low - slow);
+        sample = low - slow;
+    }
+    return signal;
+}
+
+std::pair<int, float> findMarker(std::span<const float> samples, std::span<const float> marker,
+                                 int first, int last)
+{
+    first = std::max(0, first);
+    last = std::min(last, int(samples.size() - marker.size()));
+    float best = 0, markerEnergy = 0;
+    int position = -1;
+    for (float value : marker)
+        markerEnergy += value * value;
+    for (int start = first; start <= last; ++start)
+    {
+        float dot = 0, energy = 0;
+        for (size_t i = 0; i < marker.size(); ++i)
+        {
+            const auto value = samples[size_t(start) + i];
+            dot += value * marker[i];
+            energy += value * value;
+        }
+        const float score = energy > 0 ? std::abs(dot) / std::sqrt(energy * markerEnergy) : 0;
+        if (score > best)
+        {
+            best = score;
+            position = start;
+        }
+    }
+    return {position, best};
+}
+
 float peak(std::span<const float> samples)
 {
     float value = 0;
@@ -121,44 +169,59 @@ LoopbackSyncError::LoopbackSyncError(float loopback, float microphone, float sco
 {
 }
 
-Analysed analyse(const Recording& recording, int frames)
+Analysed analyse(const Recording& recording, int frames, std::optional<int> quietDelay)
 {
-    if (frames <= 0 || recording.loopback.size() != recording.microphone.size()
-        || recording.loopback.size() < size_t(leadFrames + frames + tailFrames))
+    const bool microphoneOnly = !recording.sent.empty();
+    if (frames <= 0 || recording.microphone.size() < size_t(leadFrames + frames + tailFrames)
+        || (microphoneOnly ? recording.sent.size() != size_t(frames)
+                           : recording.loopback.size() != recording.microphone.size()))
         throw std::runtime_error("Incomplete recording.");
     const auto finite = [](float sample) { return std::isfinite(sample); };
     if (!std::all_of(recording.loopback.begin(), recording.loopback.end(), finite)
-        || !std::all_of(recording.microphone.begin(), recording.microphone.end(), finite))
+        || !std::all_of(recording.microphone.begin(), recording.microphone.end(), finite)
+        || !std::all_of(recording.sent.begin(), recording.sent.end(), finite))
         throw std::runtime_error("The audio device produced nonfinite samples.");
-    const auto signal = marker();
-    float best = 0;
-    int bestIndex = -1;
-    for (int start = 0; start < leadFrames + tailFrames - markerFrames; ++start)
-    {
-        float dot = 0, energy = 0;
-        for (int k = 0; k < markerFrames; ++k)
-        {
-            const float sample = recording.loopback[size_t(start + k)];
-            dot += sample * signal[size_t(k)];
-            energy += sample * sample;
-        }
-        const float score = energy > 0 ? std::abs(dot) / std::sqrt(energy * markerFrames) : 0;
-        if (score > best)
-        {
-            best = score;
-            bestIndex = start;
-        }
-    }
-    const auto loopPeak = peak(recording.loopback);
+
+    const int markerStart = leadFrames / 2;
     const auto micPeak = peak(recording.microphone);
-    if (best < 0.65f || bestIndex < 0)
-        throw LoopbackSyncError(loopPeak, micPeak, best);
-    const int delay = bestIndex - leadFrames / 2;
+    if (microphoneOnly)
+    {
+        const auto signal = micMarker();
+        const auto [position, score] = findMarker(recording.microphone, signal, markerStart, markerStart + maxMicDelay);
+        constexpr float minimumScore = 0.55f;
+        const bool startVerified = position >= 0 && score >= minimumScore;
+        const int candidateDelay = startVerified ? position - markerStart : quietDelay.value_or(-1);
+        if (candidateDelay < 0 || candidateDelay > maxMicDelay)
+            throw std::runtime_error("Could not verify the first mic marker. Check the levels. Use loopback for settings that mute the amp.");
+        const int endStart = leadFrames + frames + markerGap;
+        const auto [end, endScore] = findMarker(recording.microphone, signal, endStart + candidateDelay - 256,
+                                                 endStart + candidateDelay + 256);
+        const bool verified = startVerified && endScore >= minimumScore && std::abs(end - endStart - candidateDelay) <= maxMarkerDrift;
+        if (startVerified && endScore >= minimumScore && !verified)
+            throw std::runtime_error("Mic timing changed during the take. Use one audio device for input and output and try again.");
+
+        const int delay = verified ? candidateDelay : quietDelay.value_or(-1);
+        if (delay < 0 || delay > maxMicDelay)
+            throw std::runtime_error("Could not verify both mic markers. Recheck levels, or use loopback for settings that mute the amp.");
+        const int offset = leadFrames + delay - micAlignmentGuard;
+        const auto target = std::span<const float>(recording.microphone).subspan(size_t(offset), size_t(frames));
+        if (!verified && peak(target) >= 0.001f)
+            throw std::runtime_error("Could not verify both mic markers. Check the amp level and record this take again.");
+        return {delay, peak(recording.sent), micPeak, std::min(score, endScore), recording.sent,
+                {target.begin(), target.end()}, verified};
+    }
+
+    const auto signal = marker();
+    const auto [position, score] = findMarker(recording.loopback, signal, 0, leadFrames + tailFrames - markerFrames - 1);
+    const auto loopPeak = peak(recording.loopback);
+    if (score < 0.65f || position < 0)
+        throw LoopbackSyncError(loopPeak, micPeak, score);
+    const int delay = position - markerStart;
     const int offset = leadFrames + delay;
     if (offset < 0 || size_t(offset + frames) > recording.loopback.size())
         throw std::runtime_error("Measured latency is outside the capture window.");
 
-    return {delay, loopPeak, micPeak, best,
+    return {delay, loopPeak, micPeak, score,
             {recording.loopback.begin() + offset, recording.loopback.begin() + offset + frames},
             {recording.microphone.begin() + offset, recording.microphone.begin() + offset + frames}};
 }
@@ -213,20 +276,34 @@ void Recorder::start(std::span<const float> input, float sendGain, int loopIndex
         throw std::runtime_error("A recording is already running.");
     const auto openingRevision = deviceRevision();
     const auto outputs = outputCount.load();
-    if (rate.load() != sampleRate || outputs < 1 || outputs > 2 || inputCount.load() != 2
-        || loopIndex < 0 || micIndex < 0 || loopIndex > 1 || micIndex > 1 || loopIndex == micIndex)
-        throw std::runtime_error("Select two inputs and one or two outputs at 48 kHz.");
+    const bool microphoneOnly = loopIndex == -1;
+    const bool validRouting = microphoneOnly
+        ? inputCount.load() == 1 && outputs == 1 && micIndex == 0
+        : inputCount.load() == 2 && outputs >= 1 && outputs <= 2
+            && loopIndex >= 0 && loopIndex <= 1 && micIndex >= 0 && micIndex <= 1 && loopIndex != micIndex;
+    if (rate.load() != sampleRate || !validRouting)
+        throw std::runtime_error("Check the input and output channels. Capture requires 48 kHz.");
     if (peak(input) * sendGain >= 1.0f)
         throw std::runtime_error("The send trim would clip the stimulus.");
     loop = loopIndex;
     mic = micIndex;
     playback.assign(leadFrames + input.size() + tailFrames, 0.0f);
-    const auto sync = marker();
+    const auto sync = microphoneOnly ? micMarker() : marker();
     for (size_t k = 0; k < sync.size(); ++k)
-        playback[leadFrames / 2 + k] = sync[k] * sendGain * 0.3f;
+    {
+        const float value = sync[k] * sendGain * (microphoneOnly ? 0.7f : 0.3f);
+        playback[leadFrames / 2 + k] = value;
+        if (microphoneOnly)
+            playback[leadFrames + input.size() + markerGap + k] = value;
+    }
     std::transform(input.begin(), input.end(), playback.begin() + leadFrames,
                    [sendGain](float sample) { return sample * sendGain; });
-    result.loopback.assign(playback.size(), 0);
+    result.sent.clear();
+    result.loopback.clear();
+    if (microphoneOnly)
+        result.sent.assign(playback.begin() + leadFrames, playback.begin() + leadFrames + input.size());
+    else
+        result.loopback.assign(playback.size(), 0);
     result.microphone.assign(playback.size(), 0);
     cursor.store(0);
     loopPeak.store(0);
@@ -309,7 +386,7 @@ void Recorder::audioDeviceIOCallbackWithContext(const float* const* inputs, int 
                 activeOutputs[activeOutputCount] = outputs[ch];
             ++activeOutputCount;
         }
-    if (activeInputCount != 2 || activeOutputCount < 1 || activeOutputCount > 2
+    if (activeInputCount != (loop < 0 ? 1 : 2) || activeOutputCount < 1 || activeOutputCount > 2
         || activeOutputCount != outputCount.load())
     {
         state.store(State::failed);
@@ -320,12 +397,13 @@ void Recorder::audioDeviceIOCallbackWithContext(const float* const* inputs, int 
     const int count = std::min(samples, length.load() - from);
     for (int ch = 0; ch < activeOutputCount; ++ch)
         std::copy_n(playback.data() + from, count, activeOutputs[ch]);
-    std::copy_n(activeInputs[loop], count, result.loopback.data() + from);
+    if (loop >= 0)
+        std::copy_n(activeInputs[loop], count, result.loopback.data() + from);
     std::copy_n(activeInputs[mic], count, result.microphone.data() + from);
     float inputPeak = 0.0f, targetPeak = 0.0f;
     for (int i = 0; i < count; ++i)
     {
-        inputPeak = std::max(inputPeak, std::abs(activeInputs[loop][i]));
+        inputPeak = std::max(inputPeak, std::abs(loop >= 0 ? activeInputs[loop][i] : playback[size_t(from + i)]));
         targetPeak = std::max(targetPeak, std::abs(activeInputs[mic][i]));
     }
     loopPeak.store(inputPeak, std::memory_order_relaxed);

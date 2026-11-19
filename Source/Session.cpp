@@ -326,7 +326,7 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
 }
 
 Session Session::create(const juce::File& folder, juce::String name, std::vector<Control> controls,
-                        std::vector<Point> points, const std::vector<float>& input, double sendDb)
+                        std::vector<Point> points, const std::vector<float>& input, double sendDb, bool microphoneOnly)
 {
     if (name.trim().isEmpty() || sendDb > 0 || sendDb < -60)
         throw std::runtime_error("Provide an amplifier name and a send level from -60 to 0 dB.");
@@ -341,9 +341,18 @@ Session Session::create(const juce::File& folder, juce::String name, std::vector
     result.controls = std::move(controls);
     result.points = std::move(points);
     result.sendDb = sendDb;
+    result.microphoneOnly = microphoneOnly;
     result.save();
     return result;
 }
+
+namespace
+{
+bool hasVerifiedTiming(const juce::File& recording)
+{
+    return bool(readJson(recording.getChildFile("capture.json"))["sync_verified"]);
+}
+} // namespace
 
 Session Session::open(const juce::File& folder)
 {
@@ -354,6 +363,7 @@ Session Session::open(const juce::File& folder)
     result.folder = folder;
     result.amplifier = doc["amplifier"].toString();
     result.sendDb = double(doc["send_db"]);
+    result.microphoneOnly = doc["capture_mode"].toString() == "microphone_only";
     result.calibration = doc["calibration"].toString();
     const auto start = int(doc["calibration_start_sample"]);
     if (start < 0 || start > 240 * sampleRate)
@@ -372,6 +382,9 @@ Session Session::open(const juce::File& folder)
             point.dials.push_back(double(dial));
         point.test = bool(p["test"]);
         point.recording = p["recording"].toString();
+        if (result.microphoneOnly && point.recording.isNotEmpty()
+            && !hasVerifiedTiming(revision(folder, point.recording)))
+            point.recording.clear();
         result.points.push_back(std::move(point));
     }
     if (result.controls.empty() || result.points.empty() || result.sendDb > 0 || result.sendDb < -60)
@@ -385,6 +398,7 @@ void Session::save() const
     put(doc, "version", 1);
     put(doc, "amplifier", amplifier);
     put(doc, "send_db", sendDb);
+    put(doc, "capture_mode", microphoneOnly ? "microphone_only" : "loopback");
     put(doc, "calibration", calibration);
     put(doc, "calibration_start_sample", int(calibrationStart));
     put(doc, "controls", controlsJson(controls));
@@ -406,21 +420,25 @@ juce::String Session::writeCapture(const Recording& recording, const Analysed& a
     const auto id = juce::Uuid().toString();
     const auto path = revision(folder, id);
     createDirectory(path);
-    writeWav(path.getChildFile("raw-loopback.wav"), recording.loopback);
+    if (!recording.loopback.empty())
+        writeWav(path.getChildFile("raw-loopback.wav"), recording.loopback);
     writeWav(path.getChildFile("raw-microphone.wav"), recording.microphone);
     writeWav(path.getChildFile("input.wav"), analysed.input);
     writeWav(path.getChildFile("target.wav"), analysed.target);
     auto metadata = object();
     put(metadata, "delay_samples", analysed.delay);
-    put(metadata, "loopback_peak", analysed.loopPeak);
+    put(metadata, microphoneOnly ? "send_peak" : "loopback_peak", analysed.loopPeak);
     put(metadata, "microphone_peak", analysed.micPeak);
     put(metadata, "marker_correlation", analysed.correlation);
+    put(metadata, "sync_verified", analysed.syncVerified);
     writeJson(path.getChildFile("capture.json"), metadata);
     return id;
 }
 
 void Session::calibrate(const Recording& recording, const Analysed& analysed, size_t stimulusStart)
 {
+    if (microphoneOnly != !recording.sent.empty() || !analysed.syncVerified)
+        throw std::runtime_error("Calibration routing or timing could not be verified.");
     requireUsable(analysed);
     if (completed() > 0)
     {
@@ -442,12 +460,14 @@ void Session::calibrate(const Recording& recording, const Analysed& analysed, si
 std::optional<double> Session::checkQuiet(const Recording& recording, const Analysed& analysed,
                                           size_t stimulusStart) const
 {
+    if (microphoneOnly != !recording.sent.empty())
+        throw std::runtime_error("Capture mode differs from the session.");
     requireUsable(analysed, false);
     if (!hasCalibration())
         throw std::runtime_error("Check the loudest setting first.");
     const auto reference = readWav(revision(folder, calibration).getChildFile("input.wav"));
     if (compareAligned(reference, calibrationStart, analysed.input, stimulusStart) > 0.12)
-        throw std::runtime_error("Loopback changed since the loud check. Keep the send and interface gains fixed.");
+        throw std::runtime_error("Input reference changed since the loud check. Keep send and interface gains fixed.");
     return microphoneSnrDb(recording, analysed);
 }
 
@@ -465,6 +485,8 @@ void Session::setSendDb(double db)
 
 void Session::saveTake(size_t index, const Recording& recording, const Analysed& analysed, bool acceptQuietMic)
 {
+    if (microphoneOnly != !recording.sent.empty() || !analysed.syncVerified)
+        throw std::runtime_error("Take routing or timing could not be verified.");
     requireUsable(analysed, !acceptQuietMic);
     if (!hasCalibration())
         throw std::runtime_error("Run calibration before recording a take.");
@@ -512,6 +534,7 @@ void Session::exportDataset(bool normalise) const
     auto profile = object();
     put(document, "sample_rate", sampleRate);
     put(document, "capture_session", folder.getFileName());
+    put(document, "capture_mode", microphoneOnly ? "microphone_only" : "loopback");
     put(profile, "amplifier", amplifier);
     put(profile, "controls", controlsJson(controls));
     juce::Array<var> names, train, test;
@@ -546,6 +569,8 @@ void Session::exportDataset(bool normalise) const
     {
         const auto& point = points[index];
         const auto recording = revision(folder, point.recording);
+        if (microphoneOnly && !hasVerifiedTiming(recording))
+            throw std::runtime_error("Take " + std::to_string(index + 1) + " has unverified microphone timing. Record it again.");
         const auto takeInput = readWav(recording.getChildFile("input.wav"));
         if (!recording.getChildFile("target.wav").existsAsFile()
             || compareAligned(input, calibrationStart, takeInput, 0) > 0.12

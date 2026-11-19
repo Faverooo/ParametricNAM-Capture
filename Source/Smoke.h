@@ -61,7 +61,8 @@ inline void smokeTest(const juce::File& folder)
         int getCurrentBitDepth() override { return 24; }
         juce::BigInteger getActiveOutputChannels() const override { return outputMask; }
         int outputMask = 1;
-        juce::BigInteger getActiveInputChannels() const override { return 3; }
+        juce::BigInteger getActiveInputChannels() const override { return inputMask; }
+        int inputMask = 3;
         int getOutputLatencyInSamples() override { return 0; }
         int getInputLatencyInSamples() override { return 0; }
     } device;
@@ -138,5 +139,92 @@ inline void smokeTest(const juce::File& folder)
     check(manifest["train"].size() == 6 && manifest["test"].size() == 1, "Export did not preserve the held-out take.");
     const auto referenceFile = resumed.folder.getChildFile("dataset").getChildFile(manifest["x"].toString());
     check(readWav(referenceFile).size() == size_t(n), "Export used the short calibration input as the training reference.");
-    std::cout << "Simulation passed: plan, recording, alignment, retake, resume and normalised export.\n";
+    constexpr int micDelay = 4000;
+    auto simulateMic = [&](std::span<const float> audio, float volume, int drift = 0)
+    {
+        constexpr int block = 257;
+        device.inputMask = 4;
+        device.outputMask = 8;
+        recorder.audioDeviceAboutToStart(&device);
+        recorder.start(audio, 0.5f, -1, 0);
+        std::vector<float> sent;
+        std::array<float, block> input{}, output{};
+        const float* inputs[]{nullptr, nullptr, input.data()};
+        float* outputs[]{nullptr, nullptr, nullptr, output.data()};
+        float lowpass = 0;
+        while (recorder.isBusy())
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                auto position = int(sent.size()) + i - micDelay;
+                if (position > leadFrames + int(audio.size()) + 1000)
+                    position -= drift;
+                const float value = position >= 0 ? sent[size_t(position)] : 0.0f;
+                lowpass += 0.25f * (value - lowpass);
+                input[size_t(i)] = -0.5f * std::tanh(volume * lowpass) + (i % 2 == 0 ? 0.00002f : -0.00002f);
+            }
+            recorder.audioDeviceIOCallbackWithContext(inputs, 3, outputs, 4, block, {});
+            sent.insert(sent.end(), output.begin(), output.end());
+        }
+        auto result = recorder.take();
+        check(result && result->loopback.empty() && result->sent.size() == audio.size(),
+              "Microphone-only capture did not store the digital send.");
+        return std::move(*result);
+    };
+
+    auto micSession = Session::create(folder.getChildFile("microphone-only"), "Simulated mic amp",
+                                      controls, plan(controls, {}, 3), stimulus, -6.0, true);
+    const auto excerptAudio = std::span<const float>(stimulus).subspan(excerpt.start, excerpt.length);
+    const auto micCalibration = simulateMic(excerptAudio, 17.0f);
+    const auto micAligned = analyse(micCalibration, int(excerptAudio.size()));
+    check(micAligned.syncVerified && std::abs(micAligned.delay - micDelay) < 12,
+          "Microphone timing failed with filtering, clipping-like saturation and inverted polarity.");
+    micSession.calibrate(micCalibration, micAligned, excerpt.start);
+
+    for (size_t i = 0; i < micSession.points.size(); ++i)
+    {
+        auto micRaw = simulateMic(stimulus, 6.0f);
+        auto micTake = analyse(micRaw, n);
+        check(micTake.syncVerified && micTake.input == micRaw.sent,
+              "Microphone timing confirmation or input reference is incorrect.");
+        for (size_t frame = 0; frame < stimulus.size(); ++frame)
+            check(micTake.input[frame] == stimulus[frame] * 0.5f, "Digital send samples changed.");
+        micSession.saveTake(i, micRaw, micTake);
+    }
+    const auto muted = simulateMic(excerptAudio, 0.0f);
+    bool mutedRejected = false;
+    try { (void) analyse(muted, int(excerptAudio.size())); }
+    catch (const std::runtime_error&) { mutedRejected = true; }
+    check(mutedRejected, "A muted take with unverified timing was accepted.");
+    const auto quietCheck = analyse(muted, int(excerptAudio.size()), micAligned.delay);
+    check(!quietCheck.syncVerified, "Quiet check incorrectly marked timing as verified.");
+    bool quietSaveRejected = false;
+    try { micSession.saveTake(0, muted, quietCheck, true); }
+    catch (const std::runtime_error&) { quietSaveRejected = true; }
+    check(quietSaveRejected, "Manual acceptance bypassed microphone timing verification.");
+    bool driftRejected = false;
+    try { (void) analyse(simulateMic(stimulus, 4.0f, 8), n); }
+    catch (const std::runtime_error&) { driftRejected = true; }
+    check(driftRejected, "A drifting microphone recording was accepted.");
+
+    auto micResumed = Session::open(micSession.folder);
+    check(micResumed.microphoneOnly, "Microphone-only mode was lost when reopening the session.");
+    micResumed.exportDataset();
+    const auto micDataset = micSession.folder.getChildFile("dataset");
+    const auto micManifest = juce::JSON::parse(micDataset.getChildFile("manifest.json"));
+    check(micManifest["capture_mode"].toString() == "microphone_only"
+          && readWav(micDataset.getChildFile(micManifest["x"].toString())).size() == stimulus.size(),
+          "Microphone-only dataset did not export the digital send.");
+    const auto exportedInput = readWav(micDataset.getChildFile(micManifest["x"].toString()));
+    for (size_t i = 0; i < stimulus.size(); ++i)
+        check(std::abs(exportedInput[i] - stimulus[i] * 0.5f) < 2.0e-7f, "Export changed the send beyond PCM24 precision.");
+    const auto captureMeta = micSession.folder.getChildFile("recordings")
+        .getChildFile(micSession.points.front().recording).getChildFile("capture.json");
+    auto oldMeta = juce::JSON::parse(captureMeta);
+    oldMeta.getDynamicObject()->setProperty("sync_verified", false);
+    check(captureMeta.replaceWithText(juce::JSON::toString(oldMeta)), "Could not create legacy unverified fixture.");
+    auto reopened = Session::open(micSession.folder);
+    check(reopened.completed() == 2 && reopened.points.front().recording.isEmpty(),
+          "An old unverified take was not reopened for retake.");
+    std::cout << "Simulation passed: loopback and microphone-only recording, alignment, drift rejection, resume and export.\n";
 }

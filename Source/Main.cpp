@@ -62,7 +62,7 @@ public:
         for (auto* component : std::initializer_list<juce::Component*>{
                  &title, &subtitle, &wiringButton, &openButton, &planViewport, &audioViewport,
                  &welcomeLead, &microphoneHelp, &loopbackHelp, &sendHelp,
-                 &sessionTitle, &routingLabel, &loopInput, &ampOutputLabel, &ampOutput, &deviceSummary, &sendLabel, &sendLevel,
+                 &sessionTitle, &routingLabel, &loopInput, &ampOutputLabel, &ampOutput, &deviceSummary, &modeLabel, &captureMode, &sendLabel, &sendLevel,
                  &selectedTake, &list, &nextButton, &backButton, &cancelButton, &retryLoudButton, &retryQuietButton, &normalise, &statusLabel, &progressBar})
             addAndMakeVisible(component);
 
@@ -73,12 +73,12 @@ public:
 
         subtitle.setColour(juce::Label::textColourId, ink);
         subtitle.setFont(juce::FontOptions(23.0f, juce::Font::bold));
-        welcomeLead.setText("Use one audio interface with 2 inputs and 1 or 2 outputs.", juce::dontSendNotification);
+        welcomeLead.setText("Use one audio interface at 48 kHz. Choose a capture mode.", juce::dontSendNotification);
         welcomeLead.setFont(juce::FontOptions(18.0f, juce::Font::bold));
         welcomeLead.setColour(juce::Label::textColourId, ink);
-        microphoneHelp.setText("Microphone input\nConnect the mic in front of the speaker to an interface mic input.", juce::dontSendNotification);
-        loopbackHelp.setText("Loopback input\nSend a clean copy of the test signal back to a line input. Capture uses it to align the recording.", juce::dontSendNotification);
-        sendHelp.setText("One or two outputs\nSend one output to the amp via a reamp box. Use a second output for the loopback, or use internal loopback or a line-level split.", juce::dontSendNotification);
+        microphoneHelp.setText("Microphone only | 1 input, 1 output\nConnect the microphone to an input and send one output to the amp via a reamp box.", juce::dontSendNotification);
+        loopbackHelp.setText("With loopback | 2 inputs, 1 or 2 outputs\nAdd a clean return of the send signal on a line input. Use a second output or internal loopback.", juce::dontSendNotification);
+        sendHelp.setText("With loopback, Capture measures the actual send. In Microphone only, it uses the stimulus and checks timing through the microphone.", juce::dontSendNotification);
         for (auto* label : {&microphoneHelp, &loopbackHelp, &sendHelp})
         {
             label->setColour(juce::Label::textColourId, muted);
@@ -96,6 +96,16 @@ public:
         nextButton.setColour(juce::TextButton::textColourOffId, juce::Colour(background));
         deviceSummary.setColour(juce::Label::textColourId, muted);
         countsLabel.setText("Total takes", juce::dontSendNotification);
+        modeLabel.setText("Capture mode", juce::dontSendNotification);
+        captureMode.addItem("With loopback", 1);
+        captureMode.addItem("Microphone only", 2);
+        captureMode.setSelectedId(1, juce::dontSendNotification);
+        captureMode.onChange = [this]
+        {
+            levelCheck = LevelCheck::loud;
+            refreshAudioChannels();
+            resized();
+        };
         routingLabel.setText("Loopback input", juce::dontSendNotification);
         ampOutputLabel.setText("Amp output", juce::dontSendNotification);
         deviceSummary.setMinimumHorizontalScale(0.92f);
@@ -170,7 +180,7 @@ public:
                 "2. Loopback: a second output can go straight to a line input. With one output, split the line signal or use the interface's internal loopback.\n"
                 "3. Mic: place a microphone at the speaker and connect it to a mic input.\n\n"
                 "Keep the speaker or rated load connected. Never connect a speaker output to the interface.\n\n"
-                "In Audio setup enable two inputs and one or two outputs. Choose the loopback input and amp output. Capture sets 48 kHz. "
+                "In With loopback mode, enable two inputs and one or two outputs. For Microphone only, enable one mic input and one amp output. Capture sets 48 kHz. "
                 "Set the amp to its loudest planned setting and calibrate. Adjust gains for headroom, then keep them fixed.",
                 "OK");
         };
@@ -232,7 +242,7 @@ public:
         drawSteps(graphics);
         if (step == Step::calibration || step == Step::record)
         {
-            drawMeter(graphics, loopMeterArea, "Loopback", loopMeter);
+            drawMeter(graphics, loopMeterArea, microphoneOnly() ? "Send" : "Loopback", loopMeter);
             drawMeter(graphics, micMeterArea, "Mic", micMeter);
         }
         if (step == Step::record && session && list.getSelectedRow() >= 0
@@ -287,11 +297,18 @@ public:
         layoutPlan(std::max(1, area.getWidth() - planViewport.getScrollBarThickness()));
 
         auto audioArea = area;
+        auto modeRow = audioArea.removeFromTop(34);
+        modeLabel.setBounds(modeRow.removeFromLeft(118));
+        captureMode.setBounds(modeRow.removeFromLeft(225));
+        audioArea.removeFromTop(6);
         deviceSummary.setBounds(audioArea.removeFromBottom(34));
         auto roles = audioArea.removeFromBottom(32);
-        routingLabel.setBounds(roles.removeFromLeft(114));
-        loopInput.setBounds(roles.removeFromLeft(196));
-        roles.removeFromLeft(16);
+        if (!microphoneOnly())
+        {
+            routingLabel.setBounds(roles.removeFromLeft(114));
+            loopInput.setBounds(roles.removeFromLeft(196));
+            roles.removeFromLeft(16);
+        }
         ampOutputLabel.setBounds(roles.removeFromLeft(88));
         ampOutput.setBounds(roles.removeFromLeft(196));
         audioViewport.setBounds(audioArea.withTrimmedBottom(8));
@@ -458,8 +475,10 @@ private:
         const bool recording = step == Step::record;
         const bool exporting = step == Step::exportData;
         audioViewport.setVisible(audio);
-        routingLabel.setVisible(audio);
-        loopInput.setVisible(audio);
+        modeLabel.setVisible(audio);
+        captureMode.setVisible(audio);
+        routingLabel.setVisible(audio && !microphoneOnly());
+        loopInput.setVisible(audio && !microphoneOnly());
         ampOutputLabel.setVisible(audio);
         ampOutput.setVisible(audio);
         deviceSummary.setVisible(audio);
@@ -487,13 +506,17 @@ private:
         repaint();
     }
 
+    bool microphoneOnly() const { return captureMode.getSelectedId() == 2; }
+
     bool audioReady() const
     {
         const auto* device = devices.getCurrentAudioDevice();
-        if (!callbackInstalled || !device || device->getActiveInputChannels().countNumberOfSetBits() != 2)
+        if (!callbackInstalled || !device || ampOutput.getSelectedId() == 0)
             return false;
+        const int inputs = device->getActiveInputChannels().countNumberOfSetBits();
         const int outputs = device->getActiveOutputChannels().countNumberOfSetBits();
-        return outputs >= 1 && outputs <= 2 && loopInput.getSelectedId() != 0 && ampOutput.getSelectedId() != 0;
+        return microphoneOnly() ? inputs == 1 && outputs == 1
+                                : inputs == 2 && outputs >= 1 && outputs <= 2 && loopInput.getSelectedId() != 0;
     }
 
     bool forceSampleRate()
@@ -565,7 +588,14 @@ private:
         }
         const int loop = loopInput.getSelectedId();
         const int amp = ampOutput.getSelectedId();
-        if (audioReady() && active.size() == 2 && amp <= sends.size())
+        routingLabel.setVisible(step == Step::audio && !microphoneOnly());
+        loopInput.setVisible(step == Step::audio && !microphoneOnly());
+        if (audioReady() && microphoneOnly() && active.size() == 1 && sends.size() == 1)
+        {
+            deviceSummary.setText("Amp: " + sends[0] + "   |   Mic: " + active[0]
+                                  + "   |   No loopback", juce::dontSendNotification);
+        }
+        else if (audioReady() && active.size() == 2 && amp <= sends.size())
         {
             const auto returnRoute = sends.size() == 2
                 ? sends[2 - amp] + " -> " + active[loop - 1]
@@ -575,7 +605,8 @@ private:
         }
         else
         {
-            deviceSummary.setText("Enable two inputs and one or two outputs above, then choose which input is loopback.",
+            deviceSummary.setText(microphoneOnly() ? "Enable one mic input and one amp output above."
+                : "Enable two inputs and one or two outputs above, then choose the loopback input.",
                                   juce::dontSendNotification);
         }
         update();
@@ -718,7 +749,7 @@ private:
                    juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
                    [settings = std::move(settings), points = std::move(points)](CaptureView& view, const juce::File& file)
             {
-                view.setSession(capture::Session::create(file, view.name.getText(), settings, points, view.stimulus, 0.0));
+                view.setSession(capture::Session::create(file, view.name.getText(), settings, points, view.stimulus, 0.0, view.microphoneOnly()));
             });
         });
     }
@@ -737,6 +768,7 @@ private:
     {
         auto samples = next.stimulus();
         session = std::move(next);
+        captureMode.setSelectedId(session->microphoneOnly ? 2 : 1, juce::dontSendNotification);
         sessionStimulus = std::move(samples);
         calibrationExcerpt = capture::calibrationWindow(sessionStimulus);
         sendLevel.setText(juce::String(session->sendDb, 1), false);
@@ -787,10 +819,11 @@ private:
             const auto row = list.getSelectedRow();
             if (!calibration && (levelCheck != LevelCheck::complete || row < 0))
                 throw std::runtime_error("Calibrate and select a take first.");
-            const int loop = loopInput.getSelectedId() - 1;
+            const int loop = microphoneOnly() ? -1 : loopInput.getSelectedId() - 1;
             const auto source = std::span<const float>(sessionStimulus);
             const auto playback = calibration ? source.subspan(calibrationExcerpt.start, calibrationExcerpt.length) : source;
-            recorder.start(playback, juce::Decibels::decibelsToGain(float(session->sendDb)), loop, 1 - loop);
+            captureStartXRuns = devices.getXRunCount();
+            recorder.start(playback, juce::Decibels::decibelsToGain(float(session->sendDb)), loop, microphoneOnly() ? 0 : 1 - loop);
             captureIndex = calibration ? -1 : row;
             pending = true;
             progress = 0;
@@ -846,11 +879,21 @@ private:
             pending = false;
             run([&]
             {
+                if (recorder.deviceRevision() != confirmedDeviceRevision)
+                {
+                    levelCheck = LevelCheck::loud;
+                    showStep(Step::audio);
+                    throw std::runtime_error("The device changed during this take. Confirm audio setup and record again.");
+                }
+                if (devices.getXRunCount() > captureStartXRuns)
+                    throw std::runtime_error("The interface reported an audio dropout. Increase the buffer size and record this take again.");
                 capture::Analysed analysed;
                 try
                 {
                     const auto length = captureIndex < 0 ? calibrationExcerpt.length : sessionStimulus.size();
-                    analysed = capture::analyse(*recording, int(length));
+                    const auto quietDelay = microphoneOnly() && captureIndex < 0 && levelCheck == LevelCheck::quiet
+                        ? liveMicDelay : std::nullopt;
+                    analysed = capture::analyse(*recording, int(length), quietDelay);
                 }
                 catch (const capture::LoopbackSyncError& error)
                 {
@@ -874,6 +917,7 @@ private:
                 if (captureIndex < 0 && levelCheck == LevelCheck::loud)
                 {
                     session->calibrate(*recording, analysed, calibrationExcerpt.start);
+                    liveMicDelay = analysed.delay;
                     levelCheck = LevelCheck::quiet;
                     const auto micDb = juce::Decibels::gainToDecibels(analysed.micPeak);
                     if (micDb > -3.0f)
@@ -910,8 +954,7 @@ private:
         auto take = std::make_shared<std::pair<capture::Recording, capture::Analysed>>(
             std::move(recording), std::move(analysed));
         juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::WarningIcon, "Very quiet microphone",
-            "This take peaks below -60 dBFS. If this control setting intentionally mutes the amp, keep the take. "
-            "Otherwise check the mic and record it again.",
+            "This take peaks below -60 dBFS. Keep it if the amp is intentionally this quiet.",
             "Keep take", "Record again", this,
             juce::ModalCallbackFunction::create([safe = juce::Component::SafePointer<CaptureView>(this), index, take](int keep)
             {
@@ -926,7 +969,7 @@ private:
         selectNext();
         if (allRecorded())
             showStep(Step::exportData);
-        status("Take saved   |   Loop delay " + juce::String(analysed.delay) + " samples");
+        status(juce::String(microphoneOnly() ? "Take saved   |   Mic delay " : "Take saved   |   Loop delay ") + juce::String(analysed.delay) + " samples");
     }
 
     void selectNext()
@@ -949,7 +992,8 @@ private:
         list.setEnabled(!pending);
         list.repaint();
         loopInput.setEnabled(activeInputs.size() == 2 && !pending);
-        ampOutput.setEnabled(activeOutputs.size() == 2 && !pending);
+        ampOutput.setEnabled(activeOutputs.size() == 2 && !pending && !microphoneOnly());
+        captureMode.setEnabled(!session && !pending);
         sendLevel.setEnabled(ready && !pending && session->completed() == 0);
         backButton.setEnabled(!pending);
         cancelButton.setVisible(pending);
@@ -1015,10 +1059,10 @@ private:
     std::optional<capture::Session> session;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::Label title, subtitle, welcomeLead, microphoneHelp, loopbackHelp, sendHelp, nameLabel, controlsLabel, prioritiesLabel, countsLabel,
-                stimulusName, sessionTitle, routingLabel, ampOutputLabel, sendLabel, statusLabel, selectedTake, stepHint, budgetSummary, deviceSummary;
+                stimulusName, sessionTitle, routingLabel, ampOutputLabel, modeLabel, sendLabel, statusLabel, selectedTake, stepHint, budgetSummary, deviceSummary;
     juce::TextEditor name, takeCount, sendLevel;
     PlanGrid controls, priorities;
-    juce::ComboBox loopInput, ampOutput;
+    juce::ComboBox loopInput, ampOutput, captureMode;
     juce::TextButton addControl{"+ Control"}, addPriority{"+ Priority"}, wiringButton{"Wiring guide"},
                      stimulusButton{"Import stimulus"}, openButton{"Open session"},
                      nextButton{"Next"}, backButton{"Back"}, cancelButton{"Cancel"},
@@ -1027,6 +1071,7 @@ private:
     juce::ListBox list;
     std::vector<float> stimulus, sessionStimulus;
     capture::StimulusWindow calibrationExcerpt;
+    std::optional<int> liveMicDelay;
     juce::Rectangle<int> stepperArea, loopMeterArea, micMeterArea, takeSettingsArea;
     float loopMeter = 0.0f, micMeter = 0.0f;
     double progress = 0;
@@ -1036,6 +1081,7 @@ private:
     bool callbackInstalled = false, pending = false;
     LevelCheck levelCheck = LevelCheck::loud;
     int captureIndex = -1;
+    int captureStartXRuns = 0;
     unsigned confirmedDeviceRevision = 0;
 };
 

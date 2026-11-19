@@ -33,7 +33,7 @@ class Session
 {
 public:
     static Session create(const juce::File&, juce::String name, std::vector<Control>,
-                          std::vector<Point>, const std::vector<float>& stimulus, double sendDb);
+                          std::vector<Point>, const std::vector<float>& stimulus, double sendDb, bool microphoneOnly = false);
     static Session open(const juce::File&);
 
     void calibrate(const Recording&, const Analysed&, size_t stimulusStart = 0);
@@ -51,6 +51,7 @@ public:
     std::vector<Control> controls;
     std::vector<Point> points;
     double sendDb = 0;
+    bool microphoneOnly = false;
 
 private:
     void save() const;

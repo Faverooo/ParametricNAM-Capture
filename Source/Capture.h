@@ -16,7 +16,7 @@ constexpr int tailFrames = sampleRate;
 
 struct Recording
 {
-    std::vector<float> loopback, microphone;
+    std::vector<float> loopback, microphone, sent;
 };
 
 struct Analysed
@@ -24,6 +24,7 @@ struct Analysed
     int delay = 0;
     float loopPeak = 0, micPeak = 0, correlation = 0;
     std::vector<float> input, target;
+    bool syncVerified = true;
 };
 
 struct StimulusWindow
@@ -42,7 +43,7 @@ struct LoopbackSyncError : std::runtime_error
     float loopPeak, micPeak, correlation;
 };
 
-Analysed analyse(const Recording&, int frames);
+Analysed analyse(const Recording&, int frames, std::optional<int> quietDelay = std::nullopt);
 double relativeInputError(std::span<const float> reference, std::span<const float> actual);
 bool hasQuietMicrophone(const Analysed&);
 void requireUsable(const Analysed&, bool requireMicrophone = true);
