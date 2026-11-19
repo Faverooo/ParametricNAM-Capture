@@ -192,8 +192,8 @@ std::vector<Priority> parsePriorities(const juce::String& text, const std::vecto
 std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<Priority>& priorities,
                         int takeCount)
 {
-    if (takeCount < 1 || takeCount > 2000)
-        throw std::runtime_error("Choose between 1 and 2000 takes.");
+    if (takeCount < 3 || takeCount > 2000)
+        throw std::runtime_error("Choose between 3 and 2000 takes to leave room for training and a separate test.");
     const int reserved = std::accumulate(priorities.begin(), priorities.end(), 0,
                                          [](int sum, const Priority& priority) { return sum + priority.count; });
     if (reserved > takeCount)
@@ -282,14 +282,20 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         centre.push_back(std::min(control.maximum, control.minimum + (gridSteps(control) / 2) * control.step));
     }
 
+    int anchorLimit = takeCount;
     const auto offer = [&](const std::vector<double>& dials)
     {
-        if (static_cast<int>(points.size()) < takeCount && used.insert(dials).second)
+        if (static_cast<int>(points.size()) < anchorLimit && used.insert(dials).second)
             points.push_back(Point{dials, false, {}});
     };
 
     offer(high);
     offer(low);
+    if (!used.contains(high) || !used.contains(low) || static_cast<int>(points.size()) >= takeCount)
+        throw std::runtime_error("Increase the total takes or reduce priority takes to leave room for an automatic test.");
+    const int available = takeCount - static_cast<int>(points.size());
+    const int testCount = std::min(available, std::max(1, (takeCount + 2) / 5));
+    anchorLimit = takeCount - testCount;
     for (size_t axis = 0; axis < controls.size(); ++axis)
     {
         const auto& control = controls[axis];
@@ -308,7 +314,14 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         dials[axis] = control.minimum + (gridSteps(control) - 1) * control.step;
         offer(dials);
     }
-    add(takeCount - static_cast<int>(points.size()), full);
+    const auto automaticStart = points.size();
+    add(takeCount - static_cast<int>(automaticStart), full);
+    const auto automaticCount = points.size() - automaticStart;
+    for (int i = 0; i < testCount; ++i)
+    {
+        const auto index = (2 * size_t(i) + 1) * automaticCount / (2 * size_t(testCount));
+        points[automaticStart + index].test = true;
+    }
     return points;
 }
 
@@ -483,7 +496,7 @@ int Session::completed() const
 juce::String Session::pointLabel(size_t index) const
 {
     const auto& point = points.at(index);
-    auto text = juce::String(int(index + 1)) + (point.test ? "  Test    " : "   ");
+    auto text = juce::String(int(index + 1)) + "   ";
     for (size_t i = 0; i < controls.size(); ++i)
         text += controls[i].label + " " + juce::String(point.dials[i], 3).trimCharactersAtEnd("0").trimCharactersAtEnd(".") + "   ";
     return text;

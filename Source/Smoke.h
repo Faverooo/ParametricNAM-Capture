@@ -23,15 +23,16 @@ inline void smokeTest(const juce::File& folder)
           && !UpdateCheck::parseVersion("v1.2"), "Release version comparison failed.");
 
     auto controls = parseControls("gain, Gain, 2, 10, 0.5, 0.2, 1\nbass, Bass, 0, 10, 1");
-    auto points = plan(controls, parsePriorities("1, 9.7, *", controls), 3);
-    check(points.size() == 3 && points[0].dials[0] == 9.7
+    auto points = plan(controls, parsePriorities("1, 9.7, *", controls), 7);
+    check(points.size() == 7 && points[0].dials[0] == 9.7
           && points[1].dials == std::vector<double>{10, 10}
           && points[2].dials == std::vector<double>{2, 0}
-          && std::none_of(points.begin(), points.end(), [](const auto& point) { return point.test; }),
+          && !points[0].test && !points[1].test && !points[2].test
+          && std::count_if(points.begin(), points.end(), [](const auto& point) { return point.test; }) == 1,
           "Invalid priority or missing endpoints.");
     const auto oneDial = plan(parseControls("gain, Gain, 0, 10, 0.1"), {}, 6);
     check(oneDial.size() == 6 && oneDial[0].dials[0] == 10.0 && oneDial[1].dials[0] == 0.0
-          && oneDial[2].dials[0] > 9.0, "One-control plan skipped the high end.");
+          && oneDial[2].dials[0] > 9.0 && !oneDial[2].test, "One-control plan skipped the high end.");
 
     const auto signal = makeStimulus();
     const int n = sampleRate * 8;
@@ -130,10 +131,11 @@ inline void smokeTest(const juce::File& folder)
     session.saveTake(0, retake, analysed);
     check(session.points[0].recording != oldRecording, "Retake did not create a revision.");
     auto resumed = Session::open(folder);
-    check(resumed.hasCalibration() && resumed.completed() == 3, "Session resume failed.");
+    check(resumed.hasCalibration() && resumed.completed() == int(points.size()), "Session resume failed.");
     resumed.calibrate(reference, aligned, excerpt.start);
     resumed.exportDataset(true);
     const auto manifest = juce::JSON::parse(resumed.folder.getChildFile("dataset").getChildFile("manifest.json"));
+    check(manifest["train"].size() == 6 && manifest["test"].size() == 1, "Export did not preserve the held-out take.");
     const auto referenceFile = resumed.folder.getChildFile("dataset").getChildFile(manifest["x"].toString());
     check(readWav(referenceFile).size() == size_t(n), "Export used the short calibration input as the training reference.");
     std::cout << "Simulation passed: plan, recording, alignment, retake, resume and normalised export.\n";
