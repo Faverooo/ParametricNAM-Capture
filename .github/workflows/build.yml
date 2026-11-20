@@ -37,10 +37,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev libcurl4-openssl-dev
-      - run: cmake -S . -B build -DPNAM_JUCE_DIR=ci-juce -DCMAKE_BUILD_TYPE=Release "-DPNAM_RELEASE_TAG=$PNAM_RELEASE_TAG"
+      - name: Configure CMake
         shell: bash
         env:
           PNAM_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          set --
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            set -- "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          fi
+          cmake -S . -B build -DPNAM_JUCE_DIR=ci-juce -DCMAKE_BUILD_TYPE=Release \
+            "-DPNAM_RELEASE_TAG=$PNAM_RELEASE_TAG" "$@"
       - run: cmake --build build --config Release --parallel 2
       - name: Simulate a capture session
         if: runner.os == 'Linux'
@@ -51,11 +58,14 @@ jobs:
         shell: bash
         env:
           APP: ${{ matrix.app }}
-          ARCHIVE: ParametricNAM-Capture-${{ runner.os }}-${{ runner.arch }}.zip
+          ARCHIVE: ParametricNAM-Capture-${{ runner.os }}-${{ runner.os == 'macOS' && 'Universal' || runner.arch }}.zip
         run: |
           mkdir package
           cp -R "build/ParametricNAMCapture_artefacts/Release/$APP" package/
-          if [[ "$RUNNER_OS" != "macOS" ]]; then
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "package/$APP/Contents/Info.plist")
+            lipo "package/$APP/Contents/MacOS/$executable" -verify_arch arm64 x86_64
+          else
             cp build/ParametricNAMCapture_artefacts/Release/CaptureStimulus.wav package/
           fi
           cp README.md LICENSE package/
@@ -63,7 +73,7 @@ jobs:
           (cd package && cmake -E tar cf "../$ARCHIVE" --format=zip *)
       - uses: actions/upload-artifact@v6
         with:
-          name: Capture-${{ runner.os }}-${{ runner.arch }}
+          name: Capture-${{ runner.os }}-${{ runner.os == 'macOS' && 'Universal' || runner.arch }}
           path: ParametricNAM-Capture-*.zip
           if-no-files-found: error
 
