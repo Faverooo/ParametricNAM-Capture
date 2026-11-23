@@ -25,6 +25,7 @@ struct Point
 };
 
 double parseNumber(const juce::String&);
+juce::String formatDialValue(double);
 std::vector<Control> parseControls(const juce::String&);
 std::vector<Priority> parsePriorities(const juce::String&, const std::vector<Control>&);
 std::vector<Point> plan(const std::vector<Control>&, const std::vector<Priority>&, int takeCount);

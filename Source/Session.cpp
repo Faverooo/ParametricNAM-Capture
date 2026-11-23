@@ -2,7 +2,11 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
 #include <locale>
+#include <map>
 #include <sstream>
 #include <numeric>
 #include <set>
@@ -48,7 +52,7 @@ juce::StringArray fields(const juce::String& line, const char* separator)
 
 int gridSteps(const Control& control)
 {
-    return int(std::floor((control.maximum - control.minimum) / control.step + 1e-8));
+    return int(std::lround((control.maximum - control.minimum) / control.step));
 }
 
 var controlsJson(const std::vector<Control>& controls)
@@ -122,6 +126,14 @@ double parseNumber(const juce::String& text)
     return result;
 }
 
+juce::String formatDialValue(double value)
+{
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(std::numeric_limits<double>::digits10) << value;
+    return juce::String(output.str());
+}
+
 std::vector<Control> parseControls(const juce::String& text)
 {
     std::vector<Control> controls;
@@ -138,12 +150,12 @@ std::vector<Control> parseControls(const juce::String& text)
         const double modelMaximum = columns.size() == 7 ? parseNumber(columns[6]) : 1;
         if (columns[0].isEmpty() || columns[1].isEmpty()
             || !columns[0].containsOnly("abcdefghijklmnopqrstuvwxyz0123456789")
-            || !ids.insert(columns[0]).second || minimum >= maximum || !(step > 0)
-            || (maximum - minimum) / step > 100000 || step > maximum - minimum || modelMinimum >= modelMaximum)
+            || !ids.insert(columns[0]).second || minimum >= maximum || !(step > 0) || modelMinimum >= modelMaximum)
             throw std::runtime_error("Invalid control: " + line.toStdString());
         const double steps = (maximum - minimum) / step;
-        if (std::abs(steps - std::round(steps)) > 1e-7)
-            throw std::runtime_error("Each range must contain a whole number of steps.");
+        const double roundedSteps = std::round(steps);
+        if (roundedSteps < 1 || roundedSteps > 100000 || std::abs(steps - roundedSteps) > 1e-7)
+            throw std::runtime_error("Each range must contain between 1 and 100000 whole steps.");
         controls.push_back({columns[0], columns[1], minimum, maximum, step, (minimum + maximum) / 2,
                             modelMinimum, modelMaximum});
     }
@@ -195,17 +207,23 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
     if (takeCount < 3 || takeCount > 2000)
         throw std::runtime_error("Choose between 3 and 2000 takes to leave room for training and a separate test.");
     const int reserved = std::accumulate(priorities.begin(), priorities.end(), 0,
-                                         [](int sum, const Priority& priority) { return sum + priority.count; });
+                                         [](int sum, const Priority& priority) { return sum + std::max(0, priority.count); });
     if (reserved > takeCount)
         throw std::runtime_error("The priority takes exceed the take budget.");
+    if (reserved == takeCount)
+        throw std::runtime_error("Reduce priority takes to leave room for an automatic test.");
     std::set<std::vector<double>> used;
     std::vector<Point> points;
     const std::array<int, 8> bases{2, 3, 5, 7, 11, 13, 17, 19};
-
-    auto add = [&](int count, const std::vector<std::pair<double, double>>& ranges)
+    const auto exactDial = [](const Control& control, double value)
     {
-        if (count == 0)
-            return;
+        const auto nearest = std::round((value - control.minimum) / control.step);
+        const auto gridValue = nearest == gridSteps(control) ? control.maximum : control.minimum + nearest * control.step;
+        return std::abs(value - gridValue) <= control.step * 1e-8 ? gridValue : value;
+    };
+
+    const auto visitCandidates = [&](const std::vector<std::pair<double, double>>& ranges, auto&& visit)
+    {
         std::vector<int> first, width;
         std::vector<std::optional<double>> exact(controls.size());
         for (size_t i = 0; i < controls.size(); ++i)
@@ -213,48 +231,53 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
             const auto& control = controls[i];
             if (ranges[i].first == ranges[i].second)
             {
-                const double value = ranges[i].first;
-                const auto nearest = std::round((value - control.minimum) / control.step);
-                const auto gridValue = nearest == gridSteps(control) ? control.maximum : control.minimum + nearest * control.step;
-                exact[i] = std::abs(value - gridValue) <= control.step * 1e-8 ? gridValue : value;
+                exact[i] = exactDial(control, ranges[i].first);
                 first.push_back(0);
                 width.push_back(1);
                 continue;
             }
-            const auto low = int(std::ceil((ranges[i].first - control.minimum) / control.step - 1e-8));
-            const auto high = std::min(gridSteps(control),
-                int(std::floor((ranges[i].second - control.minimum) / control.step + 1e-8)));
+            const auto last = gridSteps(control);
+            const auto low = std::min(last, int(std::ceil((ranges[i].first - control.minimum) / control.step - 1e-8)));
+            const auto high = ranges[i].second == control.maximum ? last
+                : std::min(last, int(std::floor((ranges[i].second - control.minimum) / control.step + 1e-8)));
             if (high < low)
                 throw std::runtime_error("Priority includes no grid value for " + control.label.toStdString());
             first.push_back(low);
             width.push_back(high - low + 1);
         }
-        auto accept = [&](const std::vector<int>& point)
+        const auto visitPoint = [&](const std::vector<int>& point)
         {
-            Point entry;
+            std::vector<double> dials;
+            dials.reserve(controls.size());
             for (size_t i = 0; i < controls.size(); ++i)
             {
                 const auto& control = controls[i];
                 const auto value = point[i] == gridSteps(control) ? control.maximum : control.minimum + point[i] * control.step;
-                entry.dials.push_back(exact[i].value_or(value));
+                dials.push_back(exact[i].value_or(value));
             }
-            if (!used.insert(entry.dials).second)
-                return;
-            points.push_back(std::move(entry));
-            --count;
+            return visit(std::move(dials));
         };
 
-        for (int index = 1, attempts = 0; count > 0 && attempts < 50000; ++index, ++attempts)
+        constexpr int maxHaltonAttempts = 50000;
+        std::uint64_t gridSize = 1;
+        for (const auto axisWidth : width)
+            gridSize = std::min<std::uint64_t>(maxHaltonAttempts + 1, gridSize * axisWidth);
+        std::set<std::vector<int>> sampled;
+        for (int index = 1; index <= maxHaltonAttempts; ++index)
         {
             auto point = first;
             for (size_t i = 0; i < point.size(); ++i)
                 point[i] += int(halton(index, bases[i]) * width[i]);
-            accept(point);
+            if (sampled.insert(point).second && visitPoint(point))
+                return true;
+            if (sampled.size() == gridSize)
+                return false;
         }
         auto point = first;
-        while (count > 0)
+        for (;;)
         {
-            accept(point);
+            if (!sampled.contains(point) && visitPoint(point))
+                return true;
             size_t i = 0;
             for (; i < point.size(); ++i)
             {
@@ -263,15 +286,75 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
                 point[i] = first[i];
             }
             if (i == point.size())
-                break;
+                return false;
         }
-        if (count > 0)
-            throw std::runtime_error("Not enough distinct points. Reduce the take count or refine the control grid.");
     };
 
-    for (const auto& priority : priorities)
-        add(priority.count, priority.ranges);
+    std::map<std::vector<double>, size_t> owner;
+    std::vector<std::vector<std::vector<double>>> reservations(priorities.size());
+    const auto reassign = [&](size_t priorityIndex)
+    {
+        struct Move { size_t from; std::vector<double> point; };
+        std::vector<std::optional<Move>> moves(priorities.size());
+        std::vector<size_t> pending{priorityIndex};
+        moves[priorityIndex] = Move{priorityIndex, {}};
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            auto row = pending[i];
+            std::vector<double> freePoint;
+            const bool found = visitCandidates(priorities[row].ranges, [&](auto point)
+            {
+                const auto current = owner.find(point);
+                if (current == owner.end())
+                {
+                    freePoint = std::move(point);
+                    return true;
+                }
+                if (!moves[current->second])
+                {
+                    moves[current->second] = Move{row, std::move(point)};
+                    pending.push_back(current->second);
+                }
+                return false;
+            });
+            if (!found)
+                continue;
 
+            // Move each conflicting reservation along the path to the free point.
+            while (row != priorityIndex)
+            {
+                auto& move = *moves[row];
+                auto& rowPoints = reservations[row];
+                auto old = std::find(rowPoints.begin(), rowPoints.end(), move.point);
+                owner[freePoint] = row;
+                *old = std::move(freePoint);
+                freePoint = std::move(move.point);
+                row = move.from;
+            }
+            owner[freePoint] = priorityIndex;
+            reservations[priorityIndex].push_back(std::move(freePoint));
+            return true;
+        }
+        return false;
+    };
+
+    for (size_t row = 0; row < priorities.size(); ++row)
+    {
+        const auto& priority = priorities[row];
+        if (priority.count <= 0)
+            continue;
+        const auto count = size_t(priority.count);
+        auto& assigned = reservations[row];
+        visitCandidates(priority.ranges, [&](auto point)
+        {
+            if (owner.emplace(point, row).second)
+                assigned.push_back(std::move(point));
+            return assigned.size() == count;
+        });
+        while (assigned.size() < count)
+            if (!reassign(row))
+                throw std::runtime_error("Not enough distinct priority points. Reduce the take count or refine the ranges.");
+    }
     std::vector<std::pair<double, double>> full;
     std::vector<double> low, high, centre;
     for (const auto& control : controls)
@@ -281,6 +364,66 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         high.push_back(control.maximum);
         centre.push_back(std::min(control.maximum, control.minimum + (gridSteps(control) / 2) * control.step));
     }
+
+    const auto acceptsEndpoint = [&](size_t row, const std::vector<double>& endpoint)
+    {
+        if (reservations[row].empty())
+            return false;
+        for (size_t i = 0; i < controls.size(); ++i)
+        {
+            const auto [first, last] = priorities[row].ranges[i];
+            if (first == last ? exactDial(controls[i], first) != endpoint[i]
+                              : endpoint[i] < first || endpoint[i] > last)
+                return false;
+        }
+        return true;
+    };
+    const auto reserveEndpoint = [&](const std::vector<double>& missing, const std::vector<double>& other)
+    {
+        if (owner.contains(missing))
+            return false;
+        const auto current = owner.find(other);
+        for (size_t row = 0; row < priorities.size(); ++row)
+        {
+            if (!acceptsEndpoint(row, missing))
+                continue;
+            if (current == owner.end() || current->second != row || reservations[row].size() > 1)
+            {
+                auto& point = *std::find_if(reservations[row].rbegin(), reservations[row].rend(),
+                                           [&](const auto& dials) { return dials != other; });
+                owner.erase(point);
+                point = missing;
+                owner.emplace(missing, row);
+                return true;
+            }
+
+            // This row has only the other endpoint. Preserve it in another matching row.
+            for (size_t alternate = 0; alternate < priorities.size(); ++alternate)
+            {
+                if (alternate == row || !acceptsEndpoint(alternate, other))
+                    continue;
+                auto& point = reservations[alternate].back();
+                owner.erase(point);
+                point = other;
+                current->second = alternate;
+                reservations[row].front() = missing;
+                owner.emplace(missing, row);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Include a mandatory endpoint in a priority when both would consume the held-out slot.
+    for (int attempt = 0; attempt < 2 && reserved + int(!owner.contains(low)) + int(!owner.contains(high)) >= takeCount; ++attempt)
+        if (!reserveEndpoint(high, low) && !reserveEndpoint(low, high))
+            break;
+    for (auto& row : reservations)
+        for (auto& dials : row)
+        {
+            used.insert(dials);
+            points.push_back(Point{std::move(dials), false, {}});
+        }
 
     int anchorLimit = takeCount;
     const auto offer = [&](const std::vector<double>& dials)
@@ -315,7 +458,13 @@ std::vector<Point> plan(const std::vector<Control>& controls, const std::vector<
         offer(dials);
     }
     const auto automaticStart = points.size();
-    add(takeCount - static_cast<int>(automaticStart), full);
+    if (!visitCandidates(full, [&](auto dials)
+    {
+        if (used.insert(dials).second)
+            points.push_back(Point{std::move(dials), false, {}});
+        return static_cast<int>(points.size()) == takeCount;
+    }))
+        throw std::runtime_error("Not enough distinct points. Reduce the take count or refine the control grid.");
     const auto automaticCount = points.size() - automaticStart;
     for (int i = 0; i < testCount; ++i)
     {
@@ -350,7 +499,10 @@ namespace
 {
 bool hasVerifiedTiming(const juce::File& recording)
 {
-    return bool(readJson(recording.getChildFile("capture.json"))["sync_verified"]);
+    juce::var metadata;
+    const auto file = recording.getChildFile("capture.json");
+    return file.existsAsFile() && juce::JSON::parse(file.loadFileAsString(), metadata).wasOk()
+        && metadata.isObject() && metadata["sync_verified"].isBool() && bool(metadata["sync_verified"]);
 }
 } // namespace
 
@@ -369,6 +521,11 @@ Session Session::open(const juce::File& folder)
     if (start < 0 || start > 240 * sampleRate)
         throw std::runtime_error("Invalid calibration offset.");
     result.calibrationStart = size_t(start);
+    if (result.hasCalibration() && !revision(folder, result.calibration).getChildFile("input.wav").existsAsFile())
+    {
+        result.calibration.clear();
+        result.calibrationStart = 0;
+    }
     for (const auto& c : *doc["controls"].getArray())
         result.controls.push_back({c["id"].toString(), c["label"].toString(), double(c["min"]), double(c["max"]),
                                    double(c["capture_step"]), double(c["default"]), double(c["model_min"]),
@@ -382,9 +539,13 @@ Session Session::open(const juce::File& folder)
             point.dials.push_back(double(dial));
         point.test = bool(p["test"]);
         point.recording = p["recording"].toString();
-        if (result.microphoneOnly && point.recording.isNotEmpty()
-            && !hasVerifiedTiming(revision(folder, point.recording)))
-            point.recording.clear();
+        if (point.recording.isNotEmpty())
+        {
+            const auto take = revision(folder, point.recording);
+            if (!take.getChildFile("input.wav").existsAsFile() || !take.getChildFile("target.wav").existsAsFile()
+                || (result.microphoneOnly && !hasVerifiedTiming(take)))
+                point.recording.clear();
+        }
         result.points.push_back(std::move(point));
     }
     if (result.controls.empty() || result.points.empty() || result.sendDb > 0 || result.sendDb < -60)
@@ -440,13 +601,20 @@ void Session::calibrate(const Recording& recording, const Analysed& analysed, si
     if (microphoneOnly != !recording.sent.empty() || !analysed.syncVerified)
         throw std::runtime_error("Calibration routing or timing could not be verified.");
     requireUsable(analysed);
-    if (completed() > 0)
+    const auto firstRecorded = std::find_if(points.begin(), points.end(),
+        [](const Point& point) { return point.recording.isNotEmpty(); });
+    if (firstRecorded != points.end())
     {
-        const auto original = readWav(revision(folder, calibration).getChildFile("input.wav"));
-        if (compareAligned(original, calibrationStart, analysed.input, stimulusStart) > 0.12)
+        const auto originalId = hasCalibration() ? calibration : firstRecorded->recording;
+        const auto originalStart = hasCalibration() ? calibrationStart : 0;
+        const auto original = readWav(revision(folder, originalId).getChildFile("input.wav"));
+        if (compareAligned(original, originalStart, analysed.input, stimulusStart) > 0.12)
             throw std::runtime_error("The calibration differs from the original. Restore the interface levels and routing.");
-        writeCapture(recording, analysed);
-        return;
+        if (hasCalibration())
+        {
+            writeCapture(recording, analysed);
+            return;
+        }
     }
     const auto id = writeCapture(recording, analysed);
     const auto old = calibration;
@@ -520,7 +688,7 @@ juce::String Session::pointLabel(size_t index) const
     const auto& point = points.at(index);
     auto text = juce::String(int(index + 1)) + "   ";
     for (size_t i = 0; i < controls.size(); ++i)
-        text += controls[i].label + " " + juce::String(point.dials[i], 3).trimCharactersAtEnd("0").trimCharactersAtEnd(".") + "   ";
+        text += controls[i].label + " " + formatDialValue(point.dials[i]) + "   ";
     return text;
 }
 

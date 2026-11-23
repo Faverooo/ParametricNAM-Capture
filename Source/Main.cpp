@@ -431,7 +431,7 @@ private:
             g.drawFittedText(session->controls[i].label, card.removeFromTop(18), juce::Justification::centred, 1);
             g.setColour(juce::Colour(accent));
             g.setFont(juce::FontOptions(19.0f, juce::Font::bold));
-            const auto value = juce::String(point.dials[i], 3).trimCharactersAtEnd("0").trimCharactersAtEnd(".");
+            const auto value = capture::formatDialValue(point.dials[i]);
             g.drawFittedText(value, card, juce::Justification::centredTop, 1);
         }
     }
@@ -626,14 +626,15 @@ private:
                     if (audioReady())
                     {
                         confirmedDeviceRevision = recorder.deviceRevision();
-                        showStep(session ? (allRecorded() ? Step::exportData : Step::calibration) : Step::plan);
+                        showStep(session ? (allRecorded() && session->hasCalibration() ? Step::exportData : Step::calibration)
+                                         : Step::plan);
                     }
                 }
                 break;
             case Step::plan: createSession(); break;
             case Step::calibration:
                 if (levelCheck == LevelCheck::complete)
-                    showStep(Step::record);
+                    showStep(allRecorded() ? Step::exportData : Step::record);
                 else
                     start(true);
                 break;
@@ -771,7 +772,7 @@ private:
         captureMode.setSelectedId(session->microphoneOnly ? 2 : 1, juce::dontSendNotification);
         sessionStimulus = std::move(samples);
         calibrationExcerpt = capture::calibrationWindow(sessionStimulus);
-        sendLevel.setText(juce::String(session->sendDb, 1), false);
+        sendLevel.setText(capture::formatDialValue(session->sendDb), false);
         levelCheck = LevelCheck::loud;
         loopMeter = micMeter = 0.0f;
         list.updateContent();
@@ -781,16 +782,19 @@ private:
 
     void applySend()
     {
-        if (!session || pending)
+        if (!session || pending || session->completed() != 0)
             return;
-        const auto db = capture::parseNumber(sendLevel.getText());
+        const auto entered = sendLevel.getText().trim();
+        if (entered == capture::formatDialValue(session->sendDb))
+            return;
+        const auto db = capture::parseNumber(entered);
         if (db != session->sendDb)
         {
             session->setSendDb(db);
             levelCheck = LevelCheck::loud;
             status("Send level changed. Calibrate again.");
         }
-        sendLevel.setText(juce::String(session->sendDb, 1), false);
+        sendLevel.setText(capture::formatDialValue(session->sendDb), false);
     }
 
     void recheckLevels(LevelCheck check)

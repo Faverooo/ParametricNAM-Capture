@@ -33,6 +33,35 @@ inline void smokeTest(const juce::File& folder)
     const auto oneDial = plan(parseControls("gain, Gain, 0, 10, 0.1"), {}, 6);
     check(oneDial.size() == 6 && oneDial[0].dials[0] == 10.0 && oneDial[1].dials[0] == 0.0
           && oneDial[2].dials[0] > 9.0 && !oneDial[2].test, "One-control plan skipped the high end.");
+    const auto decimalGrid = parseControls("gain, Gain, 0, 1.99999995, 1");
+    const auto decimalPlan = plan(decimalGrid, parsePriorities("1, 1.9:1.99999995", decimalGrid), 3);
+    check(decimalPlan.front().dials.front() == decimalGrid.front().maximum
+          && decimalPlan.back().dials.front() == 1.0, "Decimal grid dropped a priority endpoint or interior value.");
+    check(parseControls("gain, Gain, 1.1, 1.2, 0.1").size() == 1,
+          "Decimal rounding rejected a valid one-step range.");
+    check(formatDialValue(0.0) != formatDialValue(0.0001)
+          && formatDialValue(0.1 + 0.2) == "0.3", "Dial display lost precision or exposed rounding noise.");
+    const auto priorityGrid = parseControls("gain, Gain, 0, 5, 1");
+    const auto exactReservation = plan(priorityGrid, parsePriorities("1,1:3\n1,2", priorityGrid), 5);
+    check(exactReservation[0].dials.front() != 2.0 && exactReservation[1].dials.front() == 2.0
+          && !exactReservation[0].test && !exactReservation[1].test,
+          "A ranged priority blocked a later exact reservation.");
+    const auto overlapGrid = parseControls("gain, Gain, 0, 6, 1");
+    const auto overlap = plan(overlapGrid, parsePriorities("1,1:2\n1,2:3\n2,3:4", overlapGrid), 7);
+    check(overlap[0].dials.front() == 1.0 && overlap[1].dials.front() == 2.0
+          && overlap[2].dials.front() + overlap[3].dials.front() == 7.0
+          && !overlap[0].test && !overlap[1].test && !overlap[2].test && !overlap[3].test,
+          "Overlapping priority ranges could not reassign a chain of reservations.");
+    const auto smallGrid = parseControls("gain, Gain, 0, 2, 1");
+    const auto anchored = plan(smallGrid, parsePriorities("1,0:2", smallGrid), 3);
+    check(anchored.back().test && anchored.back().dials.front() == 1.0,
+          "Priority selection consumed the held-out slot instead of including an endpoint.");
+    const auto bothAnchored = plan(priorityGrid, parsePriorities("1,0:5\n1,2:5", priorityGrid), 3);
+    check(bothAnchored[0].dials.front() == 0.0 && bothAnchored[1].dials.front() == 5.0 && bothAnchored[2].test,
+          "Both mandatory endpoints could not be retained in distinct priority rows.");
+    check(plan(smallGrid, {{0, {}}}, 3).back().test, "A disabled priority changed the take plan.");
+    const auto sendDb = parseNumber("-12.34");
+    check(parseNumber(formatDialValue(sendDb)) == sendDb, "Send level lost precision when displayed.");
 
     const auto signal = makeStimulus();
     const int n = sampleRate * 8;
@@ -139,6 +168,22 @@ inline void smokeTest(const juce::File& folder)
     check(manifest["train"].size() == 6 && manifest["test"].size() == 1, "Export did not preserve the held-out take.");
     const auto referenceFile = resumed.folder.getChildFile("dataset").getChildFile(manifest["x"].toString());
     check(readWav(referenceFile).size() == size_t(n), "Export used the short calibration input as the training reference.");
+    const auto missingInput = folder.getChildFile("recordings").getChildFile(resumed.points[0].recording).getChildFile("input.wav");
+    check(missingInput.deleteFile(), "Could not create missing recording fixture.");
+    auto incomplete = Session::open(folder);
+    check(incomplete.completed() == int(points.size()) - 1 && incomplete.points[0].recording.isEmpty(),
+          "A take with a missing WAV was not reopened for retake.");
+    incomplete.saveTake(0, retake, analysed);
+    check(incomplete.completed() == int(points.size()), "Could not retake a missing recording.");
+    const auto calibrationMeta = juce::JSON::parse(folder.getChildFile("session.json"));
+    const auto calibrationInput = folder.getChildFile("recordings")
+        .getChildFile(calibrationMeta["calibration"].toString()).getChildFile("input.wav");
+    check(calibrationInput.deleteFile(), "Could not create missing calibration fixture.");
+    auto uncalibrated = Session::open(folder);
+    check(!uncalibrated.hasCalibration() && uncalibrated.completed() == int(points.size()),
+          "A missing calibration did not retain the verified takes.");
+    uncalibrated.calibrate(reference, aligned, excerpt.start);
+    check(uncalibrated.hasCalibration(), "Could not recover a missing calibration using the surviving takes.");
     constexpr int micDelay = 4000;
     auto simulateMic = [&](std::span<const float> audio, float volume, int drift = 0)
     {
@@ -226,5 +271,9 @@ inline void smokeTest(const juce::File& folder)
     auto reopened = Session::open(micSession.folder);
     check(reopened.completed() == 2 && reopened.points.front().recording.isEmpty(),
           "An old unverified take was not reopened for retake.");
+    check(captureMeta.replaceWithText("{"), "Could not create malformed timing metadata fixture.");
+    reopened = Session::open(micSession.folder);
+    check(reopened.completed() == 2 && reopened.points.front().recording.isEmpty(),
+          "A take with unreadable timing metadata prevented session recovery.");
     std::cout << "Simulation passed: loopback and microphone-only recording, alignment, drift rejection, resume and export.\n";
 }
